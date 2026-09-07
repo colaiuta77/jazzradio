@@ -1,0 +1,2 @@
+# jazzradio
+bookoasis jazzradio plugin
