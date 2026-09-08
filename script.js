@@ -5,7 +5,7 @@
   if (!root) return;
 
   const GLOBAL_KEY = '__BookOasisJazzRadioPlayer';
-  const ENGINE_VERSION = '1.5.9';
+  const ENGINE_VERSION = '1.6.1';
   const STORAGE_STATION = 'jazzradio.station';
   const STORAGE_VOLUME = 'jazzradio.volume';
   const STORAGE_FLOAT_POS = 'jazzradio.float.position';
@@ -90,6 +90,13 @@
       document.head.appendChild(style);
     }
     style.textContent = `
+      #jazzradio-float-player .jrfp-disc{padding:0;border:0;color:inherit;cursor:pointer}
+      #jazzradio-float-player .jrfp-disc[aria-pressed="true"]{box-shadow:0 0 0 2px #eac482,0 0 12px #eac48255}
+      #jazzradio-float-player .jrfp-disc:focus-visible{outline:2px solid white;outline-offset:3px}
+      #jazzradio-float-player .jrfp-noise{display:flex;align-items:center;gap:8px;padding:0 12px 12px;color:#eac482;font-size:11px}
+      #jazzradio-float-player .jrfp-noise input{flex:1;min-width:0;accent-color:#eac482}
+      #jazzradio-float-player .jrfp-noise[hidden],#jazzradio-float-player.jrfp-collapsed .jrfp-noise{display:none!important}
+
       #jazzradio-float-player .jrfp-viz{position:relative}
       #jazzradio-float-player [data-jazzradio-power]{position:absolute;left:7.05%;top:51.2%;width:4.7%;height:30%;min-width:24px;min-height:24px;transform:translate(-50%,-50%);background:transparent;border:0;cursor:pointer;padding:0}
       #jazzradio-float-player [data-jazzradio-power][hidden]{display:none!important}
@@ -131,9 +138,10 @@
         <div class="jrfp-body">
           <div class="jrfp-cover"><img class="jrfp-cover-img" alt="" referrerpolicy="no-referrer" hidden><div class="jrfp-cover-placeholder"><i class="fa-solid fa-music"></i></div></div>
           <div class="jrfp-meta"><div class="jrfp-artist">Jazz Radio</div><div class="jrfp-title">재생 대기 중</div><div class="jrfp-station"></div></div>
-          <div class="jrfp-transport"><div class="jrfp-disc" aria-hidden="true"><i class="fa-solid fa-compact-disc"></i></div><button type="button" class="jrfp-play" aria-label="재생"><i class="fa-solid fa-play"></i></button></div>
+          <div class="jrfp-transport"><button type="button" class="jrfp-disc" aria-label="LP 노이즈" aria-pressed="false"><i class="fa-solid fa-compact-disc" aria-hidden="true"></i></button><button type="button" class="jrfp-play" aria-label="재생"><i class="fa-solid fa-play"></i></button></div>
         </div>
         <div class="jrfp-volume"><i class="fa-solid fa-volume-low"></i><input class="jrfp-volume-range" type="range" min="0" max="100" step="1" value="70" aria-label="볼륨"><span class="jrfp-volume-value">70%</span><span class="jrfp-volume-note" hidden></span></div>
+        <label class="jrfp-noise" hidden>LP 노이즈 강도 <input type="range" min="0" max="100" step="1" value="30" aria-label="LP 노이즈 강도"><output>30%</output></label>
         <button type="button" class="jrfp-peek" title="플레이어 펼치기" aria-label="플레이어 펼치기"><i class="fa-solid fa-chevron-left"></i></button>
       `;
       document.body.appendChild(floatRoot);
@@ -154,6 +162,9 @@
       waiting: false,
       error: '',
       volume: 70,
+      noiseEnabled: storageGet('jazzradio.noise.enabled', 'false') === 'true',
+      noiseControlsVisible: false,
+      noiseLevel: Math.max(0, Math.min(100, Number(storageGet('jazzradio.noise.level', '30')) || 0)),
       visualizerMode: normalizeVisualizerMode(storageGet(STORAGE_VISUALIZER_MODE, 'spectrum')),
     };
 
@@ -161,6 +172,9 @@
     let pollBusy = false;
     let audioContext = null;
     let mediaSource = null;
+    let noiseSource = null;
+    let noiseControlsTimer = null;
+    let noiseGain = null;
     let analyser = null;
     let frequencyData = null;
     let timeData = null;
@@ -218,6 +232,9 @@
         error: state.error,
         playing: currentPlaying(),
         volume: state.volume,
+        noiseEnabled: state.noiseEnabled,
+        noiseControlsVisible: state.noiseControlsVisible,
+        noiseLevel: state.noiseLevel,
         visualizerMode: state.visualizerMode,
         analysisStatus,
       };
@@ -284,6 +301,12 @@
       floatEls.play.innerHTML = playing ? '<i class="fa-solid fa-pause"></i>' : '<i class="fa-solid fa-play"></i>';
       floatEls.play.setAttribute('aria-label', playing ? '일시정지' : '재생');
       floatEls.disc.classList.toggle('playing', playing);
+      floatEls.disc.setAttribute('aria-pressed', String(state.noiseEnabled));
+      floatEls.disc.title = state.noiseEnabled ? 'LP 노이즈 끄기' : 'LP 노이즈 켜기';
+      const noiseControls = floatRoot.querySelector('.jrfp-noise');
+      noiseControls.hidden = !state.noiseEnabled || !state.noiseControlsVisible;
+      noiseControls.querySelector('input').value = String(state.noiseLevel);
+      noiseControls.querySelector('output').textContent = `${state.noiseLevel}%`;
       floatEls.viz.dataset.mode = state.visualizerMode;
       const power = floatRoot.querySelector('[data-jazzradio-power]');
       power.hidden = state.visualizerMode !== 'tube';
@@ -312,6 +335,7 @@
     }
 
     function emit() {
+      syncNoise();
       const snap = snapshot();
       Array.from(viewBindings).forEach((binding) => {
         if (!binding.root || !binding.root.isConnected) viewBindings.delete(binding);
@@ -321,6 +345,78 @@
       });
       renderFloat();
       scheduleVisualizers();
+    }
+
+    function stopNoise() {
+      if (noiseSource) { noiseSource.stop(); noiseSource.disconnect(); noiseSource = null; }
+      if (noiseGain) { noiseGain.disconnect(); noiseGain = null; }
+    }
+
+    function syncNoise() {
+      const volume = isIOSDevice() ? 1 : state.volume / 100;
+      if (disposed || !state.noiseEnabled || !state.noiseLevel || !volume || !currentPlaying() || !audioContext || audioContext.state !== 'running') {
+        stopNoise();
+        return;
+      }
+      try {
+        if (!noiseSource) {
+          // ponytail: 20-second random texture repeats; use streamed synthesis if repetition becomes noticeable.
+          const buffer = audioContext.createBuffer(1, audioContext.sampleRate * 20, audioContext.sampleRate);
+          const samples = buffer.getChannelData(0);
+          let hiss = 0;
+          let crack = 0;
+          for (let i = 0; i < samples.length; i++) {
+            hiss = hiss * .7 + (Math.random() * 2 - 1) * .024;
+            if (Math.random() < 3 / audioContext.sampleRate) crack = (Math.random() * 2 - 1) * .8;
+            samples[i] = hiss + crack;
+            crack *= .88;
+          }
+          noiseGain = audioContext.createGain();
+          noiseGain.gain.value = 0;
+          noiseGain.connect(audioContext.destination);
+          noiseSource = audioContext.createBufferSource();
+          noiseSource.buffer = buffer;
+          noiseSource.loop = true;
+          noiseSource.connect(noiseGain);
+          noiseSource.start(0, Math.random() * buffer.duration);
+        }
+        noiseGain.gain.setTargetAtTime(state.noiseLevel / 100 * volume * .12, audioContext.currentTime, .025);
+      } catch (error) {
+        stopNoise();
+        state.noiseEnabled = false;
+        storageSet('jazzradio.noise.enabled', false);
+        console.warn('[jazzradio] LP noise unavailable:', error);
+      }
+    }
+
+    function refreshNoiseControls() {
+      window.clearTimeout(noiseControlsTimer);
+      noiseControlsTimer = null;
+      state.noiseControlsVisible = state.noiseEnabled;
+      if (state.noiseEnabled) {
+        noiseControlsTimer = window.setTimeout(() => {
+          noiseControlsTimer = null;
+          state.noiseControlsVisible = false;
+          emit();
+        }, 10000);
+      }
+    }
+
+    function toggleNoise() {
+      state.noiseEnabled = !state.noiseEnabled;
+      if (state.noiseEnabled) prepareVisualizerFromGesture();
+      storageSet('jazzradio.noise.enabled', state.noiseEnabled);
+      refreshNoiseControls();
+      emit();
+    }
+
+    function setNoiseLevel(raw) {
+      const value = Number(raw);
+      if (!Number.isFinite(value)) return;
+      state.noiseLevel = Math.max(0, Math.min(100, Math.round(value)));
+      storageSet('jazzradio.noise.level', state.noiseLevel);
+      refreshNoiseControls();
+      emit();
     }
 
     function setVolume(raw) {
@@ -420,6 +516,7 @@
         if (!audioContext) {
           audioContext = new AudioContextClass();
           listen(audioContext, 'statechange', () => {
+            syncNoise();
             scheduleVisualizers();
           });
         }
@@ -524,6 +621,8 @@
       if (autoplay) play();
     }
 
+    listen(audio, 'ended', () => emit());
+    listen(audio, 'volumechange', () => { if (!isIOSDevice()) state.volume = audio.volume * 100; emit(); });
     listen(audio, 'play', () => { emit(); });
     listen(audio, 'pause', () => { state.waiting = false; emit(); });
     listen(audio, 'playing', () => { resumeAudioContext(); state.waiting = false; state.error = ''; emit(); refreshNowPlaying(); });
@@ -535,6 +634,8 @@
       emit();
     });
 
+    listen(floatEls.disc, 'click', toggleNoise);
+    listen(floatRoot.querySelector('.jrfp-noise input'), 'input', event => setNoiseLevel(event.target.value));
     listen(floatEls.play, 'click', toggle);
     listen(floatEls.close, 'click', stop);
     listen(floatEls.volume, 'input', () => setVolume(floatEls.volume.value));
@@ -1043,11 +1144,13 @@
     if (!Number.isFinite(state.volume)) state.volume = 70;
     state.volume = Math.max(0, Math.min(100, Math.round(state.volume)));
     if (!isIOSDevice()) audio.volume = state.volume / 100;
+    refreshNoiseControls();
     renderFloat();
 
     function destroy() {
       stop();
       disposed = true;
+      window.clearTimeout(noiseControlsTimer);
       window.cancelAnimationFrame(frameId);
       window.clearInterval(metadataTimer);
       window.clearInterval(visibilityTimer);
@@ -1066,6 +1169,8 @@
       version: ENGINE_VERSION,
       destroy,
       getDiagnostics: () => ({
+        noiseActive: !!noiseSource,
+        noiseGain: noiseGain ? noiseGain.gain.value : 0,
         analysisStatus,
         contextState: audioContext ? audioContext.state : 'uninitialized',
         readyState: audio.readyState,
@@ -1083,6 +1188,8 @@
       toggle,
       stop,
       setVolume,
+      toggleNoise,
+      setNoiseLevel,
       setVisualizerMode,
       cycleVisualizerMode,
       refreshNowPlaying,
@@ -1181,6 +1288,12 @@
     playButton.innerHTML = snap.playing ? '<i class="fa-solid fa-pause"></i>' : '<i class="fa-solid fa-play"></i>';
     playButton.setAttribute('aria-label', snap.playing ? '일시정지' : '재생');
     controlDisc.classList.toggle('playing', snap.playing);
+    controlDisc.setAttribute('aria-pressed', String(snap.noiseEnabled));
+    controlDisc.title = snap.noiseEnabled ? 'LP 노이즈 끄기' : 'LP 노이즈 켜기';
+    const noiseControls = root.querySelector('.jazzradio-noise');
+    noiseControls.hidden = !snap.noiseEnabled || !snap.noiseControlsVisible;
+    noiseControls.querySelector('input').value = String(snap.noiseLevel);
+    noiseControls.querySelector('output').textContent = `${snap.noiseLevel}%`;
     const power = root.querySelector('[data-jazzradio-power]');
     power.hidden = snap.visualizerMode !== 'tube';
     power.disabled = !station;
@@ -1234,6 +1347,8 @@
   if (root.__jazzradioDetach) root.__jazzradioDetach();
   root.__jazzradioDetach = engine.attachView(root, renderView);
   playButton.onclick = () => engine.toggle();
+  controlDisc.onclick = () => engine.toggleNoise();
+  root.querySelector('#jazzradio-noise-level').oninput = event => engine.setNoiseLevel(event.target.value);
   volume.oninput = () => engine.setVolume(volume.value);
   if (mainVisualizer) mainVisualizer.onclick = event => {
     if (event.target.closest('[data-jazzradio-power]')) engine.toggle();
