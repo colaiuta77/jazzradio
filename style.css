@@ -34,3 +34,10 @@
 .jazzradio-visualizer [data-jazzradio-power]:focus-visible{outline:2px solid white;outline-offset:2px;border-radius:3px}
 .jazzradio-app [hidden]{display:none!important}
 .jazzradio-analysis-note{font-size:11px;line-height:1.5;color:inherit;opacity:.48;margin:6px 4px 0}
+
+.jazzradio-control-disc{padding:0;border:0;color:inherit;cursor:pointer}
+.jazzradio-control-disc[aria-pressed="true"]{box-shadow:0 0 0 2px #eac482,0 0 16px #eac48255}
+.jazzradio-control-disc:focus-visible{outline:2px solid white;outline-offset:3px}
+.jazzradio-noise{display:flex;align-items:center;justify-content:flex-end;gap:12px;margin:12px 4px;color:#eac482;font-size:12px}
+.jazzradio-noise input{width:150px;max-width:45%;accent-color:#eac482}
+.jazzradio-noise output{min-width:32px;text-align:right}

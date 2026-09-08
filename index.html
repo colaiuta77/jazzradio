@@ -35,9 +35,9 @@
     </div>
 
     <div class="jazzradio-controls">
-      <div id="jazzradio-control-disc" class="jazzradio-control-disc" title="재생 디스크" aria-hidden="true">
-        <i class="fa-solid fa-compact-disc"></i>
-      </div>
+      <button type="button" id="jazzradio-control-disc" class="jazzradio-control-disc" title="LP 노이즈 켜기" aria-label="LP 노이즈" aria-pressed="false">
+        <i class="fa-solid fa-compact-disc" aria-hidden="true"></i>
+      </button>
       <button type="button" id="jazzradio-play" class="jazzradio-play" aria-label="재생" disabled>
         <i class="fa-solid fa-play"></i>
       </button>
@@ -49,6 +49,8 @@
       </div>
     </div>
   </section>
+
+  <label class="jazzradio-noise" hidden>LP 노이즈 강도 <input id="jazzradio-noise-level" type="range" min="0" max="100" step="1" value="30" aria-label="LP 노이즈 강도"><output>30%</output></label>
 
   <p class="jazzradio-footnote"><i class="fa-solid fa-circle-info"></i> 곡 정보는 방송국의 ICY 메타데이터에서, 앨범커버는 iTunes 검색 결과에서 가져옵니다. 재생 중 다른 메뉴로 이동하면 미니 플레이어가 계속 유지됩니다.</p>
   <p class="jazzradio-analysis-note" data-jazzradio-analysis-note hidden>이 브라우저에서 방송의 오디오 분석 신호를 받지 못했습니다. VU 바늘은 실제 신호가 있을 때 움직입니다.</p>
