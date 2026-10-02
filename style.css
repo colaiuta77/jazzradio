@@ -30,6 +30,7 @@
 .jazzradio-visualizer-stage{position:relative;height:100%;margin:0}
 .jazzradio-visualizer .jazzradio-visualizer-stage canvas{width:100%;height:100%;margin:0}
 .jazzradio-visualizer[data-mode="tube"]{background:#15121b}
+.jazzradio-visualizer[data-mode="constellation"],.jazzradio-visualizer[data-mode="particle"]{background:#000}
 .jazzradio-visualizer [data-jazzradio-power]{position:absolute;left:7.05%;top:51.2%;width:4.7%;height:30%;min-width:24px;min-height:24px;transform:translate(-50%,-50%);padding:0;border:0;background:transparent;cursor:pointer}
 .jazzradio-visualizer [data-jazzradio-power]:focus-visible{outline:2px solid white;outline-offset:2px;border-radius:3px}
 .jazzradio-app [hidden]{display:none!important}

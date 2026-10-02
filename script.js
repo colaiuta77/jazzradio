@@ -5,12 +5,12 @@
   if (!root) return;
 
   const GLOBAL_KEY = '__BookOasisJazzRadioPlayer';
-  const ENGINE_VERSION = '1.6.1';
+  const ENGINE_VERSION = '1.7.0';
   const STORAGE_STATION = 'jazzradio.station';
   const STORAGE_VOLUME = 'jazzradio.volume';
   const STORAGE_FLOAT_POS = 'jazzradio.float.position';
   const STORAGE_VISUALIZER_MODE = 'jazzradio.visualizer.mode';
-  const VISUALIZER_MODES = ['spectrum', 'mirror', 'line', 'wave', 'tube', 'ribbon', 'constellation'];
+  const VISUALIZER_MODES = ['spectrum', 'mirror', 'line', 'wave', 'tube', 'ribbon', 'constellation', 'particle'];
   const VISUALIZER_LABELS = {
     spectrum: 'LIVE SPECTRUM',
     mirror: 'MIRROR BARS',
@@ -19,6 +19,7 @@
     tube: 'VINTAGE AMP',
     ribbon: 'AMBER RIBBON',
     constellation: 'JAZZ CONSTELLATION',
+    particle: 'PARTICLE DANCE',
   };
   const DATA_URL = '/api/media/dashboard/widgets/jazzradio/data?type=general';
   const METADATA_POLL_MS = 12000;
@@ -98,6 +99,7 @@
       #jazzradio-float-player .jrfp-noise[hidden],#jazzradio-float-player.jrfp-collapsed .jrfp-noise{display:none!important}
 
       #jazzradio-float-player .jrfp-viz{position:relative}
+      #jazzradio-float-player .jrfp-viz[data-mode="constellation"],#jazzradio-float-player .jrfp-viz[data-mode="particle"]{background:#000}
       #jazzradio-float-player [data-jazzradio-power]{position:absolute;left:7.05%;top:51.2%;width:4.7%;height:30%;min-width:24px;min-height:24px;transform:translate(-50%,-50%);background:transparent;border:0;cursor:pointer;padding:0}
       #jazzradio-float-player [data-jazzradio-power][hidden]{display:none!important}
       #jazzradio-float-player [data-jazzradio-power]:focus-visible{outline:2px solid #fff;outline-offset:2px}
@@ -179,6 +181,28 @@
     let frequencyData = null;
     let timeData = null;
     let visualizerFrame = 0;
+    let particleTime = 0;
+    let particleLastTime = 0;
+    const particles = Array.from({ length: 420 }, (_, i) => ({
+      x: i % 5 === 0 ? Math.random() * 2 - 1 : (i % 3 - 1) * .65 + (Math.random() + Math.random() - 1) * .55,
+      y: Math.random() * 2 - 1,
+      z: Math.random() * 2 - 1,
+      phase: Math.random() * Math.PI * 2,
+      size: Math.random(),
+    }));
+    const particleSprites = ['255,255,255', '205,187,255', '180,241,217', '247,246,176', '189,224,255', '246,191,217', '217,234,177', '113,229,119'].map(color => {
+      const sprite = document.createElement('canvas');
+      sprite.width = sprite.height = 64;
+      const context = sprite.getContext('2d');
+      const glow = context.createRadialGradient(32, 32, 0, 32, 32, 32);
+      glow.addColorStop(0, `rgba(${color},1)`);
+      glow.addColorStop(.55, `rgba(${color},.95)`);
+      glow.addColorStop(.75, `rgba(${color},.5)`);
+      glow.addColorStop(1, `rgba(${color},0)`);
+      context.fillStyle = glow;
+      context.fillRect(0, 0, 64, 64);
+      return sprite;
+    });
     let frameId = 0;
     let disposed = false;
     let playRevision = 0;
@@ -920,37 +944,64 @@
       ctx.restore();
     }
 
-    function drawConstellation(ctx, width, height, dpr, values, fallback, playing) {
-      const count = width / dpr < 500 ? 32 : 56;
-      const phase = visualizerFrame * .006;
+    function drawParticles(ctx, width, height, dpr, values, fallback, playing, connected) {
+      const count = Math.min(particles.length, Math.max(90, Math.round(width * height / (dpr * dpr * 380))));
+      const angle = particleTime * .09;
       const nodes = [];
       ctx.save();
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, width, height);
       for (let i = 0; i < count; i++) {
-        const t = i / (count - 1);
+        const particle = particles[i];
         const level = visualizerLevel(values, i, count, fallback, playing);
-        const orbit = i * 2.39996 + phase;
+        const x = particle.x * Math.cos(angle) + particle.z * Math.sin(angle) * .3;
+        const depth = particle.z * Math.cos(angle) - particle.x * Math.sin(angle) * .3;
+        const scale = 1 / (1.15 - depth * .35);
+        const breeze = Math.sin(particle.phase + particleTime * .25);
         nodes.push({
-          x: width * (.07 + t * .86) + Math.sin(orbit * .7) * width * .025,
-          y: height * .5 + Math.sin(orbit) * height * (.12 + level * .25) * Math.sin(Math.PI * t),
-          radius: (1 + level * 1.9) * dpr,
+          x: width * (.5 + (x + breeze * .06) * .49 * scale),
+          y: height * (.5 + (particle.y + Math.sin(particle.phase + particleTime * .18) * .13) * .6 * scale),
+          radius: (.65 + particle.size ** 3 * (connected ? 4 : 8)) * (.5 + level * 2.6) * scale * dpr,
+          alpha: Math.min(1, .32 + (depth + 1) * .34) * (playing ? .9 + level * .1 : .5),
+          size: particle.size,
           level,
         });
       }
+      if (connected) {
+        const reach = Math.min(width * .22, 230 * dpr);
+        ctx.lineWidth = .45 * dpr;
+        // ponytail: bounded to 420 particles and 10 outgoing links; use a spatial grid if density grows.
+        nodes.forEach((node, i) => {
+          let links = 0;
+          for (let j = i + 1; j < count && links < 10; j++) {
+            const next = nodes[j];
+            const distance = Math.hypot(node.x - next.x, node.y - next.y);
+            if (distance >= reach) continue;
+            ctx.strokeStyle = `rgba(113,229,119,${(1 - distance / reach) * (.22 + node.level * .4) * Math.sqrt(node.alpha * next.alpha)})`;
+            ctx.beginPath(); ctx.moveTo(node.x, node.y); ctx.lineTo(next.x, next.y); ctx.stroke();
+            links++;
+          }
+        });
+      }
+      ctx.globalCompositeOperation = 'lighter';
       nodes.forEach((node, i) => {
-        // Two neighboring links per particle keep the mesh bounded on mobile.
-        for (let gap = 1; gap <= 2 && i + gap < count; gap++) {
-          const next = nodes[i + gap];
-          ctx.strokeStyle = `rgba(110,194,167,${playing ? .10 + node.level * .18 : .09})`;
-          ctx.lineWidth = .7 * dpr;
-          ctx.beginPath(); ctx.moveTo(node.x, node.y); ctx.lineTo(next.x, next.y); ctx.stroke();
+        ctx.globalAlpha = node.alpha;
+        if (connected && node.size > .8) {
+          ctx.globalAlpha = node.alpha * .3;
+          ctx.drawImage(particleSprites[7], node.x - node.radius * 2, node.y - node.radius * 2, node.radius * 4, node.radius * 4);
+          ctx.globalAlpha = node.alpha;
         }
-        ctx.fillStyle = i % 4 === 0 ? '#f2cf8e' : '#92d5bf';
-        ctx.globalAlpha = playing ? .55 + node.level * .45 : .35;
-        ctx.shadowColor = ctx.fillStyle;
-        ctx.shadowBlur = playing ? 6 * dpr : 0;
-        ctx.beginPath(); ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2); ctx.fill();
-        ctx.shadowBlur = 0;
-        ctx.globalAlpha = 1;
+        const sprite = particleSprites[connected || i % 7 === 0 ? 0 : 1 + i % 6];
+        ctx.drawImage(sprite, node.x - node.radius, node.y - node.radius, node.radius * 2, node.radius * 2);
+        if (connected && node.size > .94 && node.level > .3) {
+          ctx.strokeStyle = `rgba(183,255,187,${node.alpha * .6})`;
+          ctx.lineWidth = .6 * dpr;
+          const flare = node.radius * 2.5;
+          ctx.beginPath();
+          ctx.moveTo(node.x - flare, node.y); ctx.lineTo(node.x + flare, node.y);
+          ctx.moveTo(node.x, node.y - flare); ctx.lineTo(node.x, node.y + flare);
+          ctx.stroke();
+        }
       });
       ctx.restore();
     }
@@ -1052,7 +1103,7 @@
         power.style.height = `${124 * layout.scale / height * 100}%`;
       }
       else if (visualMode === 'ribbon') drawRibbon(ctx, width, height, dpr, values, fallback, playing);
-      else if (visualMode === 'constellation') drawConstellation(ctx, width, height, dpr, values, fallback, playing);
+      else if (visualMode === 'constellation' || visualMode === 'particle') drawParticles(ctx, width, height, dpr, values, fallback, playing, visualMode === 'constellation');
       else drawSpectrum(ctx, width, height, dpr, cssWidth, values, fallback, playing);
     }
 
@@ -1076,7 +1127,7 @@
       if (!disposed && !frameId && !document.hidden) frameId = window.requestAnimationFrame(drawVisualizers);
     }
 
-    function drawVisualizers() {
+    function drawVisualizers(timestamp) {
       frameId = 0;
       if (disposed || document.hidden) return;
       const canvases = Array.from(document.querySelectorAll('[data-jazzradio-visualizer]')).filter(canvas => {
@@ -1086,6 +1137,8 @@
       if (!canvases.length) return;
       visualizerFrame += 1;
       const playing = currentPlaying();
+      if (playing) particleTime += particleLastTime ? Math.min(.05, (timestamp - particleLastTime) / 1000) : 1 / 60;
+      particleLastTime = playing ? timestamp : 0;
       let values = null;
       let waveValues = null;
       if (analyser && playing && audioContext.state === 'running') {
