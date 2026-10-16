@@ -1,0 +1,23 @@
+mpg123-decoder 1.0.3, unchanged official browser bundle.
+Copyright 2021-2025 Ethan Halsall.
+NPM: https://registry.npmjs.org/mpg123-decoder/-/mpg123-decoder-1.0.3.tgz
+Source: https://github.com/eshaz/wasm-audio-decoders/tree/8f2428c1cd96b54dab74836c8471ff75fe35cbee
+Build instructions and Makefile: the fixed source commit above.
+The package metadata declares MIT for source originating in wasm-audio-decoders.
+The upstream README explicitly notes that bundled external source may have different terms.
+
+Included mpg123 decoder.
+Copyright (c) 1995-2020 by Michael Hipp and others.
+LGPL v2.1. The complete upstream COPYING is retained in COPYING-mpg123.txt.
+Source: https://github.com/madebr/mpg123/tree/08247b317163175e62035893af3ff9e71a5dfefd
+The mpg123 source is compiled into the browser bundle's embedded WebAssembly.
+
+Included puff inflate decoder.
+Copyright (C) 2002-2013 Mark Adler, all rights reserved.
+The complete retained copyright and permission notice is at the beginning of NOTICE-puff.txt.
+Upstream wasm-audio-decoders notes its copy was altered from the original to be inlined.
+Retained source notice: https://github.com/eshaz/wasm-audio-decoders/blob/8f2428c1cd96b54dab74836c8471ff75fe35cbee/src/common/src/puff/puff.h
+Original: https://github.com/madler/zlib/tree/master/contrib/puff
+
+The MP3 radio fixture is a bounded local diagnostic recording, not a redistributable dependency.
+Do not upload or ship that fixture.

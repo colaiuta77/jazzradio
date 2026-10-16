@@ -7,6 +7,7 @@ import threading
 import time
 import unicodedata
 from difflib import SequenceMatcher
+from pathlib import Path
 
 import requests
 
@@ -16,9 +17,11 @@ logger = logging.getLogger(__name__)
 
 METADATA_CACHE_TTL = 8
 METADATA_STALE_TTL = 120
-PLUGIN_VERSION = "1.7.0"
+PLUGIN_VERSION = "1.8.1"
 METADATA_TIMEOUT = (3, 3)
 METADATA_MAX_BLOCKS = 4
+STREAM_TIMEOUT = (3, 20)
+STREAM_DATA_URL = "/api/media/dashboard/widgets/jazzradio/data?type=general&stream=1&station="
 
 ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
 ITUNES_TIMEOUT = (2.5, 3.0)
@@ -385,12 +388,106 @@ class JazzradioMetadataProvider(BaseMetadataProvider):
             self._now_playing_cache[station_id] = {"time": now, "last_success": last_success, "data": dict(data)}
             return data
 
+    def _pcm_diagnostic_asset(self, asset):
+        from flask import Response, after_this_request, request, session
+
+        if not session.get("user_id") or set(request.args) - {"type", "limit", asset}:
+            return {"success": False, "error": "로그인 후 고정된 진단 경로를 사용해 주세요."}
+        filename, content_type = {
+            "pcm_test": ("pcm_probe.html", "text/html; charset=utf-8"),
+            "decoder": ("vendor/mpg123-decoder.min.js", "application/javascript; charset=utf-8"),
+        }[asset]
+        try:
+            content = (Path(__file__).parent / filename).read_bytes()
+        except OSError:
+            return {"success": False, "error": "PCM 진단 파일이 누락되었습니다. 플러그인 폴더 전체를 확인해 주세요."}
+
+        @after_this_request
+        def deliver_asset(response):
+            if response.status_code != 200:
+                return response
+            return Response(content, content_type=content_type, headers={
+                "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+            })
+
+        return {"success": True}
+
+    def _relay_stream(self):
+        from flask import Response, after_this_request, request, session
+
+        if not session.get("user_id"):
+            return {"success": False, "error": "로그인이 필요합니다."}
+        station = self._station_by_id(self._requested_station_id())
+        if not station or set(request.args) - {"type", "stream", "station", "limit"}:
+            return {"success": False, "error": "등록된 방송국만 중계할 수 있습니다."}
+
+        upstream = None
+        try:
+            upstream = requests.get(
+                station["stream_url"],
+                headers={
+                    "Icy-MetaData": "0",
+                    "Accept-Encoding": "identity",
+                    "User-Agent": f"BookOasis-JazzRadio/{PLUGIN_VERSION}",
+                },
+                stream=True,
+                timeout=STREAM_TIMEOUT,
+                allow_redirects=True,
+            )
+            upstream.raise_for_status()
+            content_type = upstream.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if not content_type.startswith("audio/"):
+                raise ValueError("upstream did not return audio")
+        except Exception as exc:
+            if upstream is not None:
+                upstream.close()
+            logger.warning("[jazzradio] Stream relay connection failed (%s): %s", station["id"], exc)
+            return {"success": False, "error": "방송국 중계 연결에 실패했습니다."}
+
+        def audio_chunks():
+            try:
+                for chunk in upstream.iter_content(chunk_size=1024):
+                    if chunk:
+                        yield chunk
+            except Exception as exc:
+                logger.warning("[jazzradio] Stream relay interrupted (%s): %s", station["id"], exc)
+            finally:
+                upstream.close()
+
+        relay = Response(audio_chunks(), content_type=content_type, headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        })
+        relay.call_on_close(upstream.close)
+
+        # 코어가 결과를 JSON으로 감싼 뒤 정상 응답만 오디오로 교체한다.
+        @after_this_request
+        def deliver_audio(response):
+            if response.status_code != 200:
+                relay.close()
+                return response
+            return relay
+
+        return {"success": True}
+
     def get_dashboard_data(self, db_type, limit=10):
+        try:
+            from flask import has_request_context, request
+        except ImportError:
+            pass
+        else:
+            if has_request_context():
+                for asset in ("pcm_test", "decoder"):
+                    if request.args.get(asset) == "1":
+                        return self._pcm_diagnostic_asset(asset)
+                if request.args.get("stream") == "1":
+                    return self._relay_stream()
         station_id = self._requested_station_id()
         station = self._station_by_id(station_id) if station_id else None
         return {
             "success": True,
-            "stations": [dict(item) for item in STATIONS],
+            "version": PLUGIN_VERSION,
+            "stations": [dict(item, relay_url=STREAM_DATA_URL + item["id"]) for item in STATIONS],
             "count": len(STATIONS),
             "now_playing": self._get_now_playing(station) if station else None,
         }

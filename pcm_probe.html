@@ -1,0 +1,110 @@
+<!-- 실제 라디오 MP3를 직접 디코딩해 iOS의 PCM 분석 경로를 분리 검증한다. -->
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Jazz Radio PCM 진단</title>
+  <style>
+    body{margin:24px auto;padding:0 18px;max-width:640px;background:#15151b;color:#eee;font:16px/1.6 system-ui}
+    button,select{font:inherit;padding:10px;margin:6px 4px 6px 0}button{cursor:pointer}canvas{width:100%;height:160px;background:#08080d;border-radius:12px}pre{white-space:pre-wrap;overflow-wrap:anywhere}
+  </style>
+  <script src="?type=general&amp;decoder=1" charset="utf-8"></script>
+</head>
+<body>
+  <h1>Jazz Radio PCM 진단</h1>
+  <p>기존 라디오를 멈춘 뒤 시작하세요. 약 5초간 실제 방송을 직접 디코딩해 재생·분석합니다. 이 페이지는 기존 플레이어와 분리된 검증용입니다.</p>
+  <select id="station" aria-label="방송국"><option value="radio-swiss-jazz">Radio Swiss Jazz</option><option value="relaxingjazz">RelaxingJazz</option><option value="jazz24">Jazz24</option></select>
+  <button id="start">5초 PCM 테스트</button><button id="stop" disabled>중지</button>
+  <canvas id="spectrum" aria-label="실제 PCM 주파수 분석"></canvas>
+  <pre id="result" role="status">시작 버튼을 누르면 실제 소리가 재생됩니다.</pre>
+  <script>
+    const startButton = document.getElementById('start');
+    const stopButton = document.getElementById('stop');
+    const result = document.getElementById('result');
+    const canvas = document.getElementById('spectrum');
+    const graphics = canvas.getContext('2d');
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    let active = null;
+    const summary = job => `MP3 ${job.bytes}바이트 / PCM ${job.samples}샘플\n주파수 최대 ${job.peak} / 파형 ${job.min}~${job.max}\nContext ${job.context.state}`;
+
+    async function run() {
+      if (active) return;
+      let job;
+      try {
+        const Context = window.AudioContext || window.webkitAudioContext;
+        if (!Context || !window['mpg123-decoder']) throw new Error('디코더 파일 또는 AudioContext를 불러오지 못했습니다.');
+        // 사용자 터치 안에서 Context를 만들고 즉시 재개한다.
+        const context = new Context();
+        const resumed = context.resume();
+        job = active = {context, controller:new AbortController(), nodes:new Set(), bytes:0, samples:0, peak:0, min:128, max:128, frame:0};
+        startButton.disabled = true;
+        stopButton.disabled = false;
+        result.textContent = 'MP3 디코더와 방송 연결을 준비하고 있습니다.';
+        job.timeout = setTimeout(() => { job.timedOut = true; job.controller.abort(); }, 15000);
+        const analyser = context.createAnalyser();
+        analyser.fftSize = 1024;
+        const volume = context.createGain();
+        volume.gain.value = .35;
+        analyser.connect(volume); volume.connect(context.destination);
+        job.decoder = new window['mpg123-decoder'].MPEGDecoder();
+        await Promise.all([resumed, job.decoder.ready]);
+        const response = await fetch(`${location.pathname}?type=general&stream=1&station=${encodeURIComponent(document.getElementById('station').value)}`, {credentials:'same-origin',cache:'no-store',signal:job.controller.signal});
+        if (!response.ok) throw new Error(`서버 중계 HTTP ${response.status}`);
+        if (!/audio\//i.test(response.headers.get('Content-Type') || '') || !response.body) throw new Error('서버 응답이 오디오 스트림이 아닙니다.');
+        job.reader = response.body.getReader();
+        const frequency = new Uint8Array(analyser.frequencyBinCount), wave = new Uint8Array(analyser.fftSize);
+        function draw() {
+          if (job !== active || job.controller.signal.aborted) return;
+          analyser.getByteFrequencyData(frequency); analyser.getByteTimeDomainData(wave);
+          job.peak = Math.max(job.peak, ...frequency);
+          job.min = Math.min(job.min, ...wave); job.max = Math.max(job.max, ...wave);
+          canvas.width = Math.round(canvas.clientWidth * Math.min(2, devicePixelRatio || 1)); canvas.height = 240;
+          graphics.clearRect(0,0,canvas.width,canvas.height); graphics.fillStyle = '#a98bff';
+          for (let i=0;i<48;i++) { const h=frequency[i]*.85; graphics.fillRect(i*canvas.width/48,240-h,canvas.width/48-2,h); }
+          result.textContent = `PCM 재생·분석 중\n${summary(job)}`;
+          job.frame = requestAnimationFrame(draw);
+        }
+        draw();
+        let scheduled = context.currentTime + .15, duration = 0;
+        while (duration < 5 && job.bytes < 262144 && !job.controller.signal.aborted) {
+          const {value,done} = await job.reader.read();
+          if (done) break;
+          job.bytes += value.byteLength;
+          for (let offset=0;offset<value.length && duration<5;offset+=8192) {
+            while (scheduled-context.currentTime > 1 && !job.controller.signal.aborted) await sleep(25);
+            if (job.controller.signal.aborted) break;
+            const pcm = job.decoder.decode(value.subarray(offset,offset+8192));
+            if (!pcm.samplesDecoded) continue;
+            const buffer = context.createBuffer(pcm.channelData.length,pcm.samplesDecoded,pcm.sampleRate);
+            pcm.channelData.forEach((channel,i) => buffer.copyToChannel(channel,i));
+            const source = context.createBufferSource(); source.buffer=buffer; source.connect(analyser);
+            job.nodes.add(source); source.onended=() => { job.nodes.delete(source); source.disconnect(); };
+            scheduled = Math.max(scheduled,context.currentTime+.08);
+            source.start(scheduled); scheduled+=buffer.duration; duration+=buffer.duration; job.samples+=pcm.samplesDecoded;
+          }
+        }
+        await job.reader.cancel();
+        while (context.currentTime < scheduled+.1 && !job.controller.signal.aborted) await sleep(50);
+        if (job.controller.signal.aborted) throw new Error(job.timedOut ? '15초 연결·재생 제한 초과' : '사용자가 중지했습니다.');
+        if (!job.samples) throw new Error('MP3에서 PCM을 디코딩하지 못했습니다.');
+        result.textContent = `${job.peak > 0 && job.max-job.min > 4 ? '실제 PCM 분석 확인' : 'PCM은 있으나 분석 신호 없음'}\n${summary(job)}`;
+      } catch (error) {
+        result.textContent = `${job && job.timedOut ? '연결·재생 시간 초과' : error.name + ': ' + error.message}${job ? '\n'+summary(job) : ''}`;
+      } finally {
+        if (job) {
+          clearTimeout(job.timeout); job.controller.abort(); cancelAnimationFrame(job.frame);
+          if (job.reader) await job.reader.cancel().catch(() => {});
+          job.nodes.forEach(node => { try { node.stop(); } catch (_) {} node.disconnect(); });
+          if (job.decoder) job.decoder.free();
+          await job.context.close().catch(() => {});
+        }
+        active = null; startButton.disabled = false; stopButton.disabled = true;
+      }
+    }
+    startButton.onclick = run;
+    stopButton.onclick = () => { if (active) active.controller.abort(); };
+    window.addEventListener('pagehide', () => { if (active) { active.controller.abort(); active.context.close().catch(() => {}); } });
+  </script>
+</body>
+</html>
