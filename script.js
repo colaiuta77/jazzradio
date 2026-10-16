@@ -5,7 +5,7 @@
   if (!root) return;
 
   const GLOBAL_KEY = '__BookOasisJazzRadioPlayer';
-  const ENGINE_VERSION = '1.7.0';
+  const ENGINE_VERSION = '1.8.1';
   const STORAGE_STATION = 'jazzradio.station';
   const STORAGE_VOLUME = 'jazzradio.volume';
   const STORAGE_FLOAT_POS = 'jazzradio.float.position';
@@ -23,6 +23,44 @@
   };
   const DATA_URL = '/api/media/dashboard/widgets/jazzradio/data?type=general';
   const METADATA_POLL_MS = 12000;
+  const PCM_CONNECT_MS = 12000;
+
+  function createSpectrum256() {
+    const real = new Float64Array(256), imaginary = new Float64Array(256);
+    const coefficients = Float64Array.from({ length: 256 }, (_, i) => .42 - .5 * Math.cos(2 * Math.PI * i / 256) + .08 * Math.cos(4 * Math.PI * i / 256));
+    const previous = new Float64Array(128);
+    return function spectrum(samples, output, smoothing = 0) {
+      for (let i = 0; i < 256; i++) { real[i] = samples[i] * coefficients[i]; imaginary[i] = 0; }
+      for (let i = 1, j = 0; i < 256; i++) {
+        let bit = 128;
+        while (j & bit) { j ^= bit; bit >>= 1; }
+        j ^= bit;
+        if (i < j) { const value = real[i]; real[i] = real[j]; real[j] = value; }
+      }
+      for (let length = 2; length <= 256; length *= 2) {
+        const angle = -2 * Math.PI / length, stepReal = Math.cos(angle), stepImaginary = Math.sin(angle);
+        for (let start = 0; start < 256; start += length) {
+          let twiddleReal = 1, twiddleImaginary = 0;
+          for (let j = 0; j < length / 2; j++) {
+            const left = start + j, right = left + length / 2;
+            const rotatedReal = twiddleReal * real[right] - twiddleImaginary * imaginary[right];
+            const rotatedImaginary = twiddleReal * imaginary[right] + twiddleImaginary * real[right];
+            real[right] = real[left] - rotatedReal; imaginary[right] = imaginary[left] - rotatedImaginary;
+            real[left] += rotatedReal; imaginary[left] += rotatedImaginary;
+            const nextReal = twiddleReal * stepReal - twiddleImaginary * stepImaginary;
+            twiddleImaginary = twiddleReal * stepImaginary + twiddleImaginary * stepReal;
+            twiddleReal = nextReal;
+          }
+        }
+      }
+      for (let i = 0; i < 128; i++) {
+        const magnitude = smoothing * previous[i] + (1 - smoothing) * Math.hypot(real[i], imaginary[i]) / 256;
+        previous[i] = magnitude;
+        output[i] = Math.max(0, Math.min(255, Math.floor(255 * (20 * Math.log10(magnitude) + 90) / 75)));
+      }
+      return output;
+    };
+  }
 
   function storageGet(key, fallback) {
     try {
@@ -173,22 +211,31 @@
     const viewBindings = new Set();
     let pollBusy = false;
     let audioContext = null;
+    let previousIOSSessionType = null;
     let mediaSource = null;
     let noiseSource = null;
     let noiseControlsTimer = null;
     let noiseGain = null;
+    let removeNoiseContextListener = null;
     let analyser = null;
     let frequencyData = null;
     let timeData = null;
     let visualizerFrame = 0;
     let particleTime = 0;
     let particleLastTime = 0;
-    const particles = Array.from({ length: 420 }, (_, i) => ({
-      x: i % 5 === 0 ? Math.random() * 2 - 1 : (i % 3 - 1) * .65 + (Math.random() + Math.random() - 1) * .55,
-      y: Math.random() * 2 - 1,
+    const particles = Array.from({ length: 420 }, () => ({
+      x: Math.random(),
+      y: Math.random(),
       z: Math.random() * 2 - 1,
       phase: Math.random() * Math.PI * 2,
+      phaseY: Math.random() * Math.PI * 2,
+      vx: (Math.random() < .5 ? -1 : 1) * (.008 + Math.random() * .018),
+      vy: (Math.random() < .5 ? -1 : 1) * (.025 + Math.random() * .045),
+      drift: .2 + Math.random() * .4,
       size: Math.random(),
+      energy: 0,
+      pulse: 0,
+      motion: 0,
     }));
     const particleSprites = ['255,255,255', '205,187,255', '180,241,217', '247,246,176', '189,224,255', '246,191,217', '217,234,177', '113,229,119'].map(color => {
       const sprite = document.createElement('canvas');
@@ -213,6 +260,12 @@
     let channelData = [];
     let silentSince = 0;
     let analysisStatus = 'idle';
+    let pcmJob = null;
+    let pcmError = '';
+    let decoderPromise = null;
+    let lastPlaybackError = '';
+    let serverVersion = '미확인';
+    let lastDiagnosticAt = 0;
     const listeners = [];
     const tubeImage = new Image();
     tubeImage.onload = () => scheduleVisualizers();
@@ -243,6 +296,7 @@
     };
 
     function currentPlaying() {
+      if (isIOSDevice()) return !!pcmJob && pcmJob.context.state === 'running' && pcmPlaybackTime(pcmJob) >= pcmJob.startedAt && pcmPlaybackTime(pcmJob) < pcmJob.nextAt && !state.error;
       return state.sessionStarted && !audio.paused && !audio.ended && audio.readyState >= 3 && !state.waiting && !state.error;
     }
 
@@ -252,7 +306,7 @@
         selectedStation: state.selectedStation,
         nowPlaying: state.nowPlaying,
         sessionStarted: state.sessionStarted,
-        waiting: state.waiting,
+        waiting: isIOSDevice() ? !!pcmJob && !currentPlaying() : state.waiting,
         error: state.error,
         playing: currentPlaying(),
         volume: state.volume,
@@ -322,8 +376,9 @@
       const station = state.selectedStation;
       const np = state.nowPlaying;
       const playing = currentPlaying();
-      floatEls.play.innerHTML = playing ? '<i class="fa-solid fa-pause"></i>' : '<i class="fa-solid fa-play"></i>';
-      floatEls.play.setAttribute('aria-label', playing ? '일시정지' : '재생');
+      const canPause = playing || (isIOSDevice() && !!pcmJob);
+      floatEls.play.innerHTML = canPause ? '<i class="fa-solid fa-pause"></i>' : '<i class="fa-solid fa-play"></i>';
+      floatEls.play.setAttribute('aria-label', canPause ? '일시정지' : '재생');
       floatEls.disc.classList.toggle('playing', playing);
       floatEls.disc.setAttribute('aria-pressed', String(state.noiseEnabled));
       floatEls.disc.title = state.noiseEnabled ? 'LP 노이즈 끄기' : 'LP 노이즈 켜기';
@@ -374,6 +429,21 @@
     function stopNoise() {
       if (noiseSource) { noiseSource.stop(); noiseSource.disconnect(); noiseSource = null; }
       if (noiseGain) { noiseGain.disconnect(); noiseGain = null; }
+    }
+
+    function releaseIOSContext() {
+      if (!isIOSDevice()) return;
+      stopNoise();
+      if (removeNoiseContextListener) { removeNoiseContextListener(); removeNoiseContextListener = null; }
+      const context = audioContext;
+      audioContext = null;
+      if (context) context.close().catch(() => {});
+      if (previousIOSSessionType !== null) {
+        try {
+          if (navigator.audioSession && navigator.audioSession.type === 'playback') navigator.audioSession.type = previousIOSSessionType;
+        } catch (error) { console.warn('[jazzradio] Audio Session restore failed:', error); }
+        previousIOSSessionType = null;
+      }
     }
 
     function syncNoise() {
@@ -429,6 +499,7 @@
     function toggleNoise() {
       state.noiseEnabled = !state.noiseEnabled;
       if (state.noiseEnabled) prepareVisualizerFromGesture();
+      else stopNoise();
       storageSet('jazzradio.noise.enabled', state.noiseEnabled);
       refreshNoiseControls();
       emit();
@@ -470,8 +541,9 @@
       return next;
     }
 
-    function setStations(stations) {
+    function setStations(stations, version) {
       if (!Array.isArray(stations) || !stations.length) return;
+      if (version) serverVersion = String(version);
       state.stations = stations.slice();
       if (state.selectedStation) {
         const fresh = state.stations.find((item) => item.id === state.selectedStation.id);
@@ -484,13 +556,190 @@
       emit();
     }
 
+    function relayUrl(station) {
+      if (!station || !station.relay_url) return null;
+      try {
+        const url = new URL(station.relay_url, window.location.href);
+        return url.origin === window.location.origin && /^https?:$/.test(url.protocol) ? url.href : null;
+      } catch (_) { return null; }
+    }
+
+    function loadPCMDecoder() {
+      if (window['mpg123-decoder']) return Promise.resolve();
+      if (!decoderPromise) decoderPromise = new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        const timeout = window.setTimeout(() => finish(new Error('디코더 연결 시간 초과')), PCM_CONNECT_MS);
+        function finish(error) {
+          window.clearTimeout(timeout);
+          script.remove();
+          if (error) { decoderPromise = null; reject(error); }
+          else resolve();
+        }
+        script.src = `${DATA_URL}&decoder=1`;
+        script.onload = () => finish(window['mpg123-decoder'] ? null : new Error('디코더 파일을 확인해 주세요.'));
+        script.onerror = () => finish(new Error('디코더 파일을 불러오지 못했습니다.'));
+        document.head.appendChild(script);
+      });
+      return decoderPromise;
+    }
+
+    function stopPCMPlayback() {
+      const job = pcmJob;
+      pcmJob = null;
+      if (!job) return;
+      window.clearTimeout(job.timeout);
+      window.clearInterval(job.monitor);
+      job.controller.abort();
+      if (job.reader) job.reader.cancel().catch(() => {});
+      job.frames.length = 0;
+      job.tail = null;
+      const end = job.context.currentTime + .02;
+      job.gain.gain.cancelScheduledValues(job.context.currentTime);
+      job.gain.gain.setValueAtTime(job.gain.gain.value, job.context.currentTime);
+      job.gain.gain.linearRampToValueAtTime(0, end);
+      job.nodes.forEach(source => source.stop(end));
+      if (!job.nodes.size || job.context.state !== 'running') job.gain.disconnect();
+    }
+
+    function armPCMTimeout(job) {
+      window.clearTimeout(job.timeout);
+      job.timeout = window.setTimeout(() => {
+        if (pcmJob !== job) return;
+        pcmError = 'PCM 재생 데이터 12초 대기 초과';
+        state.error = pcmError;
+        state.waiting = false;
+        stopPCMPlayback();
+        emit();
+      }, PCM_CONNECT_MS);
+    }
+
+    async function startPCMPlayback(station, resumed) {
+      const context = audioContext;
+      const gain = context.createGain();
+      gain.gain.value = 0;
+      gain.connect(context.destination);
+      const job = pcmJob = { context, gain, nodes: new Set(), controller: new AbortController(), frames: [], spectrum: createSpectrum256(), mono: new Float32Array(256), samples: 0, status: 'loading' };
+      // 화면 프레임이 멈춘 동안에도 LP와 재생 상태를 실제 음악 출력에 맞춘다.
+      job.monitor = window.setInterval(() => {
+        if (pcmJob !== job) return;
+        const playing = currentPlaying();
+        const status = job.samples ? (playing ? 'playing' : 'buffering') : 'loading';
+        syncNoise();
+        if (job.status === status) return;
+        job.status = status;
+        state.waiting = !playing;
+        emit();
+        if (playing) refreshNowPlaying();
+      }, 100);
+      armPCMTimeout(job);
+      try {
+        await Promise.all([resumed, loadPCMDecoder()]);
+        if (!relayUrl(station)) throw new Error('방송 중계 주소를 확인해 주세요.');
+        if (pcmJob !== job) return;
+        job.decoder = new window['mpg123-decoder'].MPEGDecoder();
+        await job.decoder.ready;
+        job.decoderReady = true;
+        if (pcmJob !== job) return;
+        const response = await fetch(relayUrl(station), { credentials: 'same-origin', cache: 'no-store', signal: job.controller.signal });
+        if (pcmJob !== job) { if (response.body) await response.body.cancel(); return; }
+        if (!response.ok) throw new Error(`방송 중계 HTTP ${response.status}`);
+        if (!/^audio\//i.test(response.headers.get('Content-Type') || '') || !response.body) throw new Error('서버 응답이 오디오 스트림이 아닙니다.');
+        job.reader = response.body.getReader();
+        while (pcmJob === job) {
+          const { value, done } = await job.reader.read();
+          if (pcmJob !== job) return;
+          if (done) throw new Error('방송 스트림이 종료되었습니다.');
+          for (let offset = 0; offset < value.length && pcmJob === job; offset += 8192) {
+            // 예약된 소리와 같은 샘플을 보관하며 수신 묶음 사이에도 연속 재생한다.
+            while (pcmJob === job && job.nextAt - context.currentTime > 2) await new Promise(resolve => window.setTimeout(resolve, 10));
+            if (pcmJob !== job) return;
+            const pcm = job.decoder.decode(value.subarray(offset, offset + 8192));
+            if (!pcm.samplesDecoded) continue;
+            const channels = [0, 1].map(i => {
+              const samples = new Float32Array(1024 + pcm.samplesDecoded);
+              if (job.tail) samples.set(job.tail[i]);
+              samples.set(pcm.channelData[Math.min(i, pcm.channelData.length - 1)], 1024);
+              return samples;
+            });
+            const buffer = context.createBuffer(2, pcm.samplesDecoded, pcm.sampleRate);
+            for (let i = 0; i < 2; i++) buffer.copyToChannel(pcm.channelData[Math.min(i, pcm.channelData.length - 1)], i);
+            const source = context.createBufferSource();
+            source.buffer = buffer;
+            source.connect(gain);
+            if (!job.nextAt || job.nextAt < context.currentTime) {
+              job.startedAt = job.nextAt = context.currentTime + .75;
+              gain.gain.cancelScheduledValues(context.currentTime);
+              gain.gain.setValueAtTime(0, context.currentTime);
+              gain.gain.setValueAtTime(0, job.startedAt);
+              gain.gain.linearRampToValueAtTime(1, job.startedAt + .015);
+            }
+            const at = job.nextAt;
+            job.nodes.add(source);
+            source.onended = () => {
+              source.disconnect();
+              job.nodes.delete(source);
+              if (pcmJob !== job && !job.nodes.size) gain.disconnect();
+            };
+            source.start(at);
+            job.frames.push({ at, channels, length: pcm.samplesDecoded, sampleRate: pcm.sampleRate });
+            job.tail = channels.map(channel => channel.slice(-1024));
+            job.nextAt = at + pcm.samplesDecoded / pcm.sampleRate;
+            job.samples += pcm.samplesDecoded;
+            while (job.frames.length > 1 && job.frames[1].at <= pcmPlaybackTime(job)) job.frames.shift();
+            armPCMTimeout(job);
+            scheduleVisualizers();
+          }
+        }
+      } catch (error) {
+        if (pcmJob === job) {
+          pcmError = error.message || 'PCM 재생 오류';
+          state.error = pcmError;
+          state.waiting = false;
+          console.warn('[jazzradio] PCM playback unavailable:', error);
+        }
+      } finally {
+        if (job.decoderReady) job.decoder.free();
+        if (pcmJob === job) { stopPCMPlayback(); emit(); }
+      }
+    }
+
+    function pcmPlaybackTime(job) {
+      const context = job.context;
+      const stamp = context.getOutputTimestamp && context.getOutputTimestamp();
+      if (stamp && stamp.performanceTime > 0) return Math.min(context.currentTime, stamp.contextTime + Math.max(0, performance.now() - stamp.performanceTime) / 1000);
+      return Math.max(0, context.currentTime - (context.outputLatency || context.baseLatency || 0));
+    }
+
+    function readPCMAnalysis(job, dt) {
+      const now = pcmPlaybackTime(job);
+      job.analysisTime = now;
+      while (job.frames.length > 1 && job.frames[1].at <= now) job.frames.shift();
+      const frame = job.frames[0];
+      if (!frame || now < frame.at || now > frame.at + frame.length / frame.sampleRate + .15) return;
+      const end = 1025 + Math.min(frame.length - 1, Math.floor((now - frame.at) * frame.sampleRate));
+      const byte = value => Math.max(0, Math.min(255, Math.floor(128 * (1 + value))));
+      for (let i = 0; i < 1024; i++) {
+        channelData[0][i] = byte(frame.channels[0][end - 1024 + i]);
+        channelData[1][i] = byte(frame.channels[1][end - 1024 + i]);
+      }
+      for (let i = 0; i < 256; i++) {
+        job.mono[i] = (frame.channels[0][end - 256 + i] + frame.channels[1][end - 256 + i]) / 2;
+        timeData[i] = byte(job.mono[i]);
+      }
+      job.spectrum(job.mono, frequencyData, Math.pow(.82, dt * 60));
+    }
+
     function setSourceForStation(station) {
       if (!station) return;
       const expected = new URL(station.stream_url, window.location.href).href;
       if (audio.src === expected) return;
       audio.pause();
-      audio.src = station.stream_url;
+      audio.src = expected;
       audio.load();
+      if (frequencyData) frequencyData.fill(0);
+      if (timeData) timeData.fill(128);
+      channelData.forEach(data => data.fill(128));
+      silentSince = 0;
     }
 
     async function refreshNowPlaying() {
@@ -530,22 +779,43 @@
     }
 
     function prepareVisualizerFromGesture() {
+      if (isIOSDevice()) {
+        if (!frequencyData) {
+          frequencyData = new Uint8Array(128);
+          timeData = new Uint8Array(256).fill(128);
+          channelData = [new Uint8Array(1024).fill(128), new Uint8Array(1024).fill(128)];
+        }
+      }
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
       if (!AudioContextClass) {
         return false;
       }
       try {
-        // Safari/iOS requires AudioContext creation/resume and MediaElementSource wiring
-        // to happen synchronously inside the user's play/tap gesture.
+        if (isIOSDevice() && navigator.audioSession) {
+          try {
+            // iOS 무음 스위치가 음악까지 차단하지 않도록 Context 생성 전에 지정한다.
+            const previous = navigator.audioSession.type;
+            navigator.audioSession.type = 'playback';
+            if (previousIOSSessionType === null) previousIOSSessionType = previous;
+          } catch (error) { console.warn('[jazzradio] Audio Session playback unavailable:', error); }
+        }
+        // AudioContext와 PC의 미디어 연결은 사용자 재생 제스처 안에서 준비한다.
         if (!audioContext) {
-          audioContext = new AudioContextClass();
-          listen(audioContext, 'statechange', () => {
+          const context = audioContext = new AudioContextClass();
+          const onStateChange = () => {
+            if (audioContext !== context) return;
+            if (isIOSDevice() && pcmJob && pcmJob.samples && context.state !== 'running') pause();
             syncNoise();
             scheduleVisualizers();
-          });
+          };
+          context.addEventListener('statechange', onStateChange);
+          const remove = () => context.removeEventListener('statechange', onStateChange);
+          if (isIOSDevice()) removeNoiseContextListener = remove;
+          else listeners.push(remove);
         }
+        if (isIOSDevice()) return true;
         resumeAudioContext();
-        if (!mediaSource) {
+        if (!analyser) {
           mediaSource = audioContext.createMediaElementSource(audio);
           analyser = audioContext.createAnalyser();
           analyser.fftSize = 256;
@@ -562,14 +832,16 @@
             node.fftSize = 1024;
             return new Uint8Array(node.fftSize);
           });
-          // Upmix mono streams before splitting so both speakers keep their audio.
-          mediaSource.connect(analyser);
-          analyser.connect(splitter);
-          channelAnalysers.forEach((node, i) => {
-            splitter.connect(node, i);
-            node.connect(merger, 0, i);
-          });
-          merger.connect(audioContext.destination);
+          if (mediaSource) {
+            // Upmix mono streams before splitting so both speakers keep their audio.
+            mediaSource.connect(analyser);
+            analyser.connect(splitter);
+            channelAnalysers.forEach((node, i) => {
+              splitter.connect(node, i);
+              node.connect(merger, 0, i);
+            });
+            merger.connect(audioContext.destination);
+          }
           frequencyData = new Uint8Array(analyser.frequencyBinCount);
           timeData = new Uint8Array(analyser.fftSize);
         }
@@ -584,22 +856,39 @@
       const station = state.selectedStation;
       if (!station) return;
       const revision = ++playRevision;
+      stopPCMPlayback();
+      pcmError = '';
+      lastPlaybackError = '';
       state.sessionStarted = true;
       silentSince = 0;
       state.error = '';
       state.waiting = true;
       storageSet(STORAGE_STATION, station.id);
+      if (isIOSDevice()) {
+        if (!prepareVisualizerFromGesture()) {
+          state.waiting = false;
+          state.error = '오디오 재생을 준비하지 못했습니다. 다시 재생해 주세요.';
+          emit();
+          return;
+        }
+        startPCMPlayback(station, audioContext.resume());
+        emit();
+        return;
+      }
       setSourceForStation(station);
+      state.waiting = true;
       prepareVisualizerFromGesture();
-      emit();
-      refreshNowPlaying();
       try {
-        await audio.play();
+        const request = audio.play();
+        emit();
+        refreshNowPlaying();
+        await request;
         if (disposed || revision !== playRevision) return;
         state.waiting = false;
         emit();
       } catch (error) {
         if (disposed || revision !== playRevision) return;
+        lastPlaybackError = error.name || '재생 오류';
         state.waiting = false;
         state.error = '재생을 시작하지 못했습니다. 다시 한 번 재생 버튼을 눌러 주세요.';
         console.warn('[jazzradio] play failed:', error);
@@ -609,21 +898,28 @@
 
     function pause() {
       playRevision += 1;
+      state.waiting = false;
+      stopPCMPlayback();
       cancelMetadata();
       audio.pause();
+      emit();
     }
 
     function toggle() {
       if (!state.selectedStation) return;
-      if (audio.paused) play();
+      if (isIOSDevice() ? !pcmJob : audio.paused) play();
       else pause();
     }
 
     function stop() {
       playRevision += 1;
+      stopPCMPlayback();
+      pcmError = '';
+      lastPlaybackError = '';
       cancelMetadata();
       setFloatCollapsed(false);
       audio.pause();
+      releaseIOSContext();
       audio.removeAttribute('src');
       try { audio.load(); } catch (_) { /* ignore */ }
       state.sessionStarted = false;
@@ -639,24 +935,32 @@
       const changed = !state.selectedStation || state.selectedStation.id !== station.id;
       state.selectedStation = station;
       storageSet(STORAGE_STATION, station.id);
-      if (changed) { cancelMetadata(); state.nowPlaying = null; }
+      if (changed) { stopPCMPlayback(); pcmError = ''; cancelMetadata(); state.nowPlaying = null; }
       state.error = '';
-      emit();
       if (autoplay) play();
+      else emit();
     }
 
-    listen(audio, 'ended', () => emit());
-    listen(audio, 'volumechange', () => { if (!isIOSDevice()) state.volume = audio.volume * 100; emit(); });
-    listen(audio, 'play', () => { emit(); });
-    listen(audio, 'pause', () => { state.waiting = false; emit(); });
-    listen(audio, 'playing', () => { resumeAudioContext(); state.waiting = false; state.error = ''; emit(); refreshNowPlaying(); });
-    listen(audio, 'waiting', () => { if (state.sessionStarted) { state.waiting = true; emit(); } });
-    listen(audio, 'error', () => {
-      if (!state.sessionStarted) return;
-      state.waiting = false;
-      state.error = '방송 스트림에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.';
-      emit();
-    });
+    if (!isIOSDevice()) {
+      listen(audio, 'ended', () => { stopPCMPlayback(); emit(); });
+      listen(audio, 'volumechange', () => { if (!isIOSDevice()) state.volume = audio.volume * 100; emit(); });
+      listen(audio, 'play', () => { emit(); });
+      listen(audio, 'pause', () => {
+        // A source change can queue this event after the new connection has started.
+        if (audio.paused) { stopPCMPlayback(); stopNoise(); }
+        emit();
+      });
+      listen(audio, 'playing', () => { resumeAudioContext(); state.waiting = false; state.error = ''; emit(); refreshNowPlaying(); });
+      listen(audio, 'waiting', () => { stopPCMPlayback(); if (state.sessionStarted) { state.waiting = true; emit(); } });
+      listen(audio, 'error', () => {
+        if (!state.sessionStarted) return;
+        lastPlaybackError = `미디어 오류 ${audio.error ? audio.error.code : 0}`;
+        stopPCMPlayback();
+        state.waiting = false;
+        state.error = '방송 스트림에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.';
+        emit();
+      });
+    }
 
     listen(floatEls.disc, 'click', toggleNoise);
     listen(floatRoot.querySelector('.jrfp-noise input'), 'input', event => setNoiseLevel(event.target.value));
@@ -801,7 +1105,8 @@
 
     function visualizerLevel(values, index, count, fallback, playing) {
       if (!playing) return 0.08;
-      if (!fallback && values && values.length) {
+      if (!fallback) {
+        if (!values || !values.length) return .035;
         const maxBin = Math.min(values.length - 1, 72);
         const idx = Math.min(maxBin, Math.floor((index / Math.max(1, count - 1)) * maxBin));
         return Math.max(.035, Math.pow(values[idx] / 255, .78));
@@ -900,7 +1205,7 @@
         if (playing && !fallback && timeValues && timeValues.length) {
           const idx = Math.min(timeValues.length - 1, Math.floor((i / Math.max(1, points - 1)) * (timeValues.length - 1)));
           normalized = (timeValues[idx] - 128) / 128;
-        } else if (playing) {
+        } else if (playing && fallback) {
           const phase = visualizerFrame * .075 + i * .28;
           normalized = Math.sin(phase) * .56 + Math.sin(phase * .47 + .8) * .24;
         }
@@ -944,25 +1249,56 @@
       ctx.restore();
     }
 
+    function updateParticles(dt, values, playing) {
+      if (!playing) return;
+      let bass = 0;
+      if (values && values.length) {
+        const end = Math.min(8, values.length);
+        for (let i = 1; i < end; i++) bass += values[i] / 255;
+        bass /= Math.max(1, end - 1);
+      }
+      particles.forEach((particle, i) => {
+        // Stable frequency assignment keeps main and mini particles in sync.
+        const bin = values && values.length ? Math.min(values.length - 1, 1 + Math.floor(((i * 37 % 101) / 100) ** 2 * 71)) : 0;
+        const target = values && values.length ? Math.min(1, .75 * values[bin] / 255 + .25 * bass) : 0;
+        const rise = Math.max(0, target - particle.energy);
+        particle.pulse = Math.max(particle.pulse * Math.exp(-dt / .16), rise);
+        particle.energy += (target - particle.energy) * (1 - Math.exp(-dt / (target > particle.energy ? .035 : .18)));
+        particle.motion += dt * (.012 + particle.energy * .45 + particle.pulse * .6);
+      });
+    }
+
     function drawParticles(ctx, width, height, dpr, values, fallback, playing, connected) {
       const count = Math.min(particles.length, Math.max(90, Math.round(width * height / (dpr * dpr * 380))));
-      const angle = particleTime * .09;
+      // Keep the camera tilt bounded so the field never turns edge-on.
+      const tiltX = Math.sin(particleTime * .13) * .10;
+      const tiltY = Math.sin(particleTime * .10) * .14;
+      const cosX = Math.cos(tiltX), sinX = Math.sin(tiltX);
+      const cosY = Math.cos(tiltY), sinY = Math.sin(tiltY);
+      const reflect = value => 1 - Math.abs(((value % 2 + 2) % 2) - 1);
       const nodes = [];
       ctx.save();
       ctx.fillStyle = '#000';
       ctx.fillRect(0, 0, width, height);
       for (let i = 0; i < count; i++) {
         const particle = particles[i];
-        const level = visualizerLevel(values, i, count, fallback, playing);
-        const x = particle.x * Math.cos(angle) + particle.z * Math.sin(angle) * .3;
-        const depth = particle.z * Math.cos(angle) - particle.x * Math.sin(angle) * .3;
-        const scale = 1 / (1.15 - depth * .35);
-        const breeze = Math.sin(particle.phase + particleTime * .25);
+        const time = particle.motion * (connected ? .7 : 1.15);
+        const level = playing ? particle.energy : 0;
+        const life = (particleTime * .12 + particle.phase / (Math.PI * 2)) % 1;
+        const fade = Math.min(1, life / .3, (1 - life) / .7);
+        const x = reflect(particle.x + particle.vx * time + Math.sin(particle.phase + time * particle.drift) * .04) - .5;
+        const y = reflect(particle.y + particle.vy * time + Math.sin(particle.phaseY + time * particle.drift * .73) * .055) - .5;
+        const depth = particle.z * .7 + Math.sin(particle.phaseY + time * .17) * .3;
+        const rotatedX = x * cosY + depth * .2 * sinY;
+        const rotatedZ = depth * .2 * cosY - x * sinY;
+        const rotatedY = y * cosX - rotatedZ * sinX;
+        const scale = 1 / (1.15 - (y * sinX + rotatedZ * cosX) * 1.1);
+        const pulse = playing ? particle.pulse : 0;
         nodes.push({
-          x: width * (.5 + (x + breeze * .06) * .49 * scale),
-          y: height * (.5 + (particle.y + Math.sin(particle.phase + particleTime * .18) * .13) * .6 * scale),
-          radius: (.65 + particle.size ** 3 * (connected ? 4 : 8)) * (.5 + level * 2.6) * scale * dpr,
-          alpha: Math.min(1, .32 + (depth + 1) * .34) * (playing ? .9 + level * .1 : .5),
+          x: width * (.5 + rotatedX * .94),
+          y: height * (.5 + rotatedY * .90),
+          radius: (.7 + particle.size ** 2 * (connected ? 3.5 : 7)) * (1 + level * (connected ? 6.5 : 5) + pulse * 3) * (.5 + fade * .5) * scale * dpr,
+          alpha: Math.min(1, .45 + (depth + 1) * .34) * Math.sqrt(fade) * (playing ? Math.min(1, .45 + level * .8 + pulse * .4) : .35),
           size: particle.size,
           level,
         });
@@ -977,7 +1313,7 @@
             const next = nodes[j];
             const distance = Math.hypot(node.x - next.x, node.y - next.y);
             if (distance >= reach) continue;
-            ctx.strokeStyle = `rgba(113,229,119,${(1 - distance / reach) * (.22 + node.level * .4) * Math.sqrt(node.alpha * next.alpha)})`;
+            ctx.strokeStyle = `rgba(113,229,119,${(1 - distance / reach) * (.18 + (node.level + next.level) * .45) * Math.sqrt(node.alpha * next.alpha)})`;
             ctx.beginPath(); ctx.moveTo(node.x, node.y); ctx.lineTo(next.x, next.y); ctx.stroke();
             links++;
           }
@@ -1117,8 +1453,12 @@
 
     function hasUsableTimeData(values) {
       if (!values || !values.length) return false;
+      let min = 255;
+      let max = 0;
       for (let i = 0; i < values.length; i += 1) {
-        if (Math.abs(values[i] - 128) > 2) return true;
+        min = Math.min(min, values[i]);
+        max = Math.max(max, values[i]);
+        if (max - min > 4) return true;
       }
       return false;
     }
@@ -1137,7 +1477,8 @@
       if (!canvases.length) return;
       visualizerFrame += 1;
       const playing = currentPlaying();
-      if (playing) particleTime += particleLastTime ? Math.min(.05, (timestamp - particleLastTime) / 1000) : 1 / 60;
+      const particleDt = playing && particleLastTime ? Math.min(.05, (timestamp - particleLastTime) / 1000) : 1 / 60;
+      if (playing) particleTime += particleDt;
       particleLastTime = playing ? timestamp : 0;
       let values = null;
       let waveValues = null;
@@ -1152,21 +1493,36 @@
           if (analysisStatus !== 'unavailable') console.warn('[jazzradio] Audio analysis failed:', error);
         }
       }
+      if (isIOSDevice() && frequencyData) {
+        frequencyData.fill(0);
+        timeData.fill(128);
+        channelData.forEach(data => data.fill(128));
+        if (playing) readPCMAnalysis(pcmJob, particleDt);
+        values = frequencyData;
+        waveValues = timeData;
+      }
       const hasData = hasUsableFrequencyData(values) || hasUsableTimeData(waveValues);
+      updateParticles(particleDt, values, playing);
       if (playing && !hasData) { if (!silentSince) silentSince = performance.now(); }
       else silentSince = 0;
-      const status = !playing ? 'idle' : hasData ? 'live' : silentSince && performance.now() - silentSince > 3000 ? 'unavailable' : 'waiting';
+      const status = !playing ? (pcmJob ? 'waiting' : 'idle') : hasData ? 'live' : silentSince && performance.now() - silentSince > 3000 ? 'unavailable' : 'waiting';
       if (status !== analysisStatus) {
         analysisStatus = status;
-        if (status === 'unavailable') console.warn('[jazzradio] No Web Audio samples from this stream', {contextState: audioContext && audioContext.state, readyState: audio.readyState, src: audio.currentSrc});
+        if (isIOSDevice()) state.waiting = !!pcmJob && !playing;
+        if (status === 'unavailable') console.warn('[jazzradio] No audio analysis samples from this stream', {contextState: audioContext && audioContext.state, readyState: audio.readyState, src: audio.currentSrc});
         emit();
+        if (isIOSDevice() && playing) refreshNowPlaying();
       }
       const left = playing && hasData ? vuLevel(channelData[0]) : 0;
       const right = playing && hasData ? vuLevel(channelData[1]) : 0;
       analogVuLeft = playing ? analogVuLeft + (left - analogVuLeft) * (left > analogVuLeft ? .35 : .12) : 0;
       analogVuRight = playing ? analogVuRight + (right - analogVuRight) * (right > analogVuRight ? .35 : .12) : 0;
-      canvases.forEach(canvas => drawCanvas(canvas, values, waveValues, !hasData, playing, state.visualizerMode));
-      if (playing) scheduleVisualizers();
+      canvases.forEach(canvas => drawCanvas(canvas, values, waveValues, !hasData && !isIOSDevice(), playing, state.visualizerMode));
+      if (isIOSDevice() && state.sessionStarted && performance.now() - lastDiagnosticAt > 1000) {
+        lastDiagnosticAt = performance.now();
+        emit();
+      }
+      if (playing || pcmJob) scheduleVisualizers();
     }
 
     function attachView(viewRoot, render) {
@@ -1192,6 +1548,7 @@
         scheduleVisualizers();
       }
     });
+    listen(window, 'pagehide', pause);
 
     state.volume = Number(storageGet(STORAGE_VOLUME, '70'));
     if (!Number.isFinite(state.volume)) state.volume = 70;
@@ -1222,12 +1579,27 @@
       version: ENGINE_VERSION,
       destroy,
       getDiagnostics: () => ({
+        version: ENGINE_VERSION,
+        serverVersion,
         noiseActive: !!noiseSource,
         noiseGain: noiseGain ? noiseGain.gain.value : 0,
         analysisStatus,
-        contextState: audioContext ? audioContext.state : 'uninitialized',
+        contextState: audioContext ? audioContext.state : isIOSDevice() ? '미사용' : 'uninitialized',
+        audioSessionType: isIOSDevice() && navigator.audioSession ? navigator.audioSession.type : '미지원',
         readyState: audio.readyState,
+        mediaAttached: !!mediaSource,
         stream: audio.currentSrc,
+        playbackRoute: isIOSDevice() ? 'pcm' : 'direct',
+        analysisRoute: isIOSDevice() ? 'pcm' : 'media',
+        pcmStatus: pcmJob ? pcmJob.status : pcmError ? 'error' : 'idle',
+        pcmSamples: pcmJob ? pcmJob.samples : 0,
+        pcmBufferedMs: pcmJob ? Math.max(0, (pcmJob.nextAt || 0) - pcmJob.context.currentTime) * 1000 : 0,
+        pcmAnalysisTime: pcmJob ? pcmJob.analysisTime : null,
+        pcmError,
+        playbackError: lastPlaybackError,
+        frequencyPeak: frequencyData ? Math.max(...frequencyData) : null,
+        waveMin: timeData ? Math.min(...timeData) : null,
+        waveMax: timeData ? Math.max(...timeData) : null,
         vuLeft: analogVuLeft,
         vuRight: analogVuRight,
       }),
@@ -1338,8 +1710,9 @@
     }
 
     playButton.disabled = !station;
-    playButton.innerHTML = snap.playing ? '<i class="fa-solid fa-pause"></i>' : '<i class="fa-solid fa-play"></i>';
-    playButton.setAttribute('aria-label', snap.playing ? '일시정지' : '재생');
+    const canPause = snap.playing || (isIOSDevice() && snap.waiting);
+    playButton.innerHTML = canPause ? '<i class="fa-solid fa-pause"></i>' : '<i class="fa-solid fa-play"></i>';
+    playButton.setAttribute('aria-label', canPause ? '일시정지' : '재생');
     controlDisc.classList.toggle('playing', snap.playing);
     controlDisc.setAttribute('aria-pressed', String(snap.noiseEnabled));
     controlDisc.title = snap.noiseEnabled ? 'LP 노이즈 끄기' : 'LP 노이즈 켜기';
@@ -1353,7 +1726,21 @@
     power.setAttribute('aria-pressed', String(snap.playing));
     power.setAttribute('aria-label', snap.playing ? '라디오 일시정지' : '라디오 재생');
     const analysisNote = root.querySelector('[data-jazzradio-analysis-note]');
-    analysisNote.hidden = snap.analysisStatus !== 'unavailable';
+    let pcmLink = root.querySelector('[data-jazzradio-pcm-link]');
+    if (!pcmLink) {
+      pcmLink = document.createElement('a');
+      pcmLink.dataset.jazzradioPcmLink = '';
+      pcmLink.className = 'jazzradio-analysis-note';
+      pcmLink.href = `${DATA_URL}&pcm_test=1`;
+      pcmLink.target = '_blank';
+      pcmLink.rel = 'noopener';
+      pcmLink.textContent = '5초 PCM 진단 열기';
+      analysisNote.before(pcmLink);
+    }
+    pcmLink.hidden = !isIOSDevice();
+    const diagnostic = engine.getDiagnostics();
+    const route = diagnostic.analysisRoute === 'pcm' ? `PCM 분석 ${diagnostic.pcmStatus}` : '기본 분석';
+    analysisNote.textContent = `앱 ${diagnostic.version} / 서버 ${diagnostic.serverVersion} · ${diagnostic.playbackRoute === 'pcm' ? '단일 PCM 재생' : '방송국 직접 재생'}(${diagnostic.playbackRoute === 'pcm' ? 'Web Audio 출력' : diagnostic.mediaAttached ? 'Web Audio 출력' : '기본 오디오 출력'}) · ${route} · 분석 ${diagnostic.analysisStatus} · Context ${diagnostic.contextState}${isIOSDevice() ? ` · Audio Session ${diagnostic.audioSessionType}` : ''} · 주파수 ${diagnostic.frequencyPeak} / 파형 ${diagnostic.waveMin}~${diagnostic.waveMax} · LP 노이즈 ${snap.noiseEnabled ? `켜짐 ${snap.noiseLevel}%` : '꺼짐'}${diagnostic.pcmError ? ` · PCM 오류 ${diagnostic.pcmError}` : ''}${diagnostic.playbackError ? ` · 재생 오류 ${diagnostic.playbackError}` : ''}`;
     if (visualizerModeButton && visualizerModeLabelEl) {
       visualizerModeButton.dataset.mode = snap.visualizerMode;
       if (mainVisualizer) mainVisualizer.dataset.mode = snap.visualizerMode;
@@ -1421,7 +1808,7 @@
       })
       .then((data) => {
         if (!data || data.success !== true || !Array.isArray(data.stations) || !data.stations.length) throw new Error('No stations returned');
-        engine.setStations(data.stations);
+        engine.setStations(data.stations, data.version);
       })
       .catch((error) => {
         console.error('[jazzradio] station load failed:', error);

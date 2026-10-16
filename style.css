@@ -35,6 +35,10 @@
 .jazzradio-visualizer [data-jazzradio-power]:focus-visible{outline:2px solid white;outline-offset:2px;border-radius:3px}
 .jazzradio-app [hidden]{display:none!important}
 .jazzradio-analysis-note{font-size:11px;line-height:1.5;color:inherit;opacity:.48;margin:6px 4px 0}
+.jazzradio-diagnostics{margin:12px 4px 0}
+.jazzradio-diagnostics summary{width:fit-content;padding:5px 0;font-size:11px;line-height:1.5;opacity:.65;cursor:pointer}
+.jazzradio-diagnostics summary:focus-visible{outline:2px solid #a98bff;outline-offset:3px;border-radius:3px}
+.jazzradio-diagnostics .jazzradio-footnote{margin:8px 4px 0}
 
 .jazzradio-control-disc{padding:0;border:0;color:inherit;cursor:pointer}
 .jazzradio-control-disc[aria-pressed="true"]{box-shadow:0 0 0 2px #eac482,0 0 16px #eac48255}

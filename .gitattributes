@@ -1,0 +1,3 @@
+# 내장 WASM 디코더와 원본 라이선스의 바이트를 보존한다.
+vendor/mpg123-decoder.min.js -text -diff -whitespace
+vendor/COPYING-mpg123.txt -text -whitespace
