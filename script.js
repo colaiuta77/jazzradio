@@ -1,15 +1,19 @@
+// 재생 엔진을 공유하는 재즈 라디오 화면과 하단 도크를 관리한다.
 (function () {
   'use strict';
 
   const root = document.getElementById('jazzradio-app');
   if (!root) return;
+  if (root.__jazzradioDetach) root.__jazzradioDetach();
 
   const GLOBAL_KEY = '__BookOasisJazzRadioPlayer';
-  const ENGINE_VERSION = '1.8.1';
+  const ENGINE_VERSION = '1.12.0';
   const STORAGE_STATION = 'jazzradio.station';
   const STORAGE_VOLUME = 'jazzradio.volume';
-  const STORAGE_FLOAT_POS = 'jazzradio.float.position';
   const STORAGE_VISUALIZER_MODE = 'jazzradio.visualizer.mode';
+  const STORAGE_COLOR_THEME = 'jazzradio.color.theme';
+  const STORAGE_COLOR_TONE = 'jazzradio.color.tone';
+  const STORAGE_DOCK_POSITION = 'jazzradio.visualizer.position';
   const VISUALIZER_MODES = ['spectrum', 'mirror', 'line', 'wave', 'tube', 'ribbon', 'constellation', 'particle'];
   const VISUALIZER_LABELS = {
     spectrum: 'LIVE SPECTRUM',
@@ -22,6 +26,7 @@
     particle: 'PARTICLE DANCE',
   };
   const DATA_URL = '/api/media/dashboard/widgets/jazzradio/data?type=general';
+  const DEFAULT_BACKGROUND = {url:'https://images.unsplash.com/photo-1415201364774-f6f0bb35f28f?auto=format&fit=crop&w=2200&q=80',source_url:'https://unsplash.com/s/photos/jazz?utm_source=bookoasis_jazzradio&utm_medium=referral'};
   const METADATA_POLL_MS = 12000;
   const PCM_CONNECT_MS = 12000;
 
@@ -86,6 +91,73 @@
     return VISUALIZER_LABELS[normalizeVisualizerMode(mode)] || VISUALIZER_LABELS.spectrum;
   }
 
+  function normalizeColorTheme(value) {
+    const color = /^#[0-9a-f]{6}$/i.test(String(value || '')) ? String(value).toLowerCase() : '';
+    return color === '#fbbf24' ? '#d6bd78' : color;
+  }
+
+  function normalizeColorTone(value) {
+    const number = typeof value === 'number' || typeof value === 'string' && value.trim() ? Number(value) : NaN;
+    return Number.isFinite(number) ? Math.max(0, Math.min(100, Math.round(number))) : 100;
+  }
+
+  function normalizeDockPosition(value) {
+    return value === 'below' ? 'below' : 'above';
+  }
+
+  function createColorPalette(color, light, strength = 100) {
+    if (!color && strength === 100) return null;
+    const desaturate = hex => {
+      const rgb = hex.slice(1).match(/../g).map(value => parseInt(value, 16));
+      const gray = rgb[0] * .2126 + rgb[1] * .7152 + rgb[2] * .0722;
+      return rgb.map(value => Math.round(gray + (value - gray) * strength / 100));
+    };
+    const ribbon = ['#82563c', '#b97b4b', '#e2a857', '#ffe0a0', '#ecc683', '#bcb995'];
+    if (!color) {
+      const shade = hex => desaturate(hex).join(',');
+      return {
+        accent: shade(light ? '#246d90' : '#54b2dc'), icon: shade(light ? '#315e77' : '#b9dcee'),
+        primary: `rgb(${shade('#38bdf8')})`, soft: `rgb(${shade('#bae6fd')})`,
+        line: shade('#76daff'), lineGlow: shade('#7957ff'), wave: shade(light ? '#246d90' : '#54b2dc'),
+        ribbon: createColorPalette('#38bdf8', false, strength).ribbon,
+      };
+    }
+    const original = desaturate(color === '#d6bd78' && light ? '#846023' : color);
+    const luminance = rgb => rgb.map(value => {
+      value /= 255;
+      return value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4;
+    }).reduce((sum, value, index) => sum + value * [.2126, .7152, .0722][index], 0);
+    const background = luminance(light ? [248, 246, 240] : [17, 21, 34]);
+    let base = original;
+    for (let step = 0; step <= 20; step++) {
+      base = original.map(value => Math.round(value + ((light ? 0 : 255) - value) * step / 20));
+      const level = luminance(base);
+      if ((Math.max(level, background) + .05) / (Math.min(level, background) + .05) >= 4.5) break;
+    }
+    const mix = amount => base.map(value => Math.round(amount < 0 ? value * (1 + amount) : value + (255 - value) * amount));
+    const lightness = hex => {
+      const rgb = hex.slice(1).match(/../g).map(value => parseInt(value, 16));
+      return (Math.min(...rgb) + Math.max(...rgb)) / 510;
+    };
+    // 기존 그라데이션과 리본 층의 명암 차이를 선택한 색상 계열에 옮긴다.
+    const tone = (source, reference) => {
+      const level = lightness(source), anchor = lightness(reference);
+      return mix(level >= anchor ? (level - anchor) / (1 - anchor) : (level - anchor) / anchor);
+    };
+    const soft = tone('#bae6fd', '#38bdf8');
+    let primary = base;
+    // 밝은 선택색도 중앙 하이라이트와 구별되도록 끝색만 어둡게 한다.
+    if (!light) {
+      for (let step = 1; step <= 20 && (luminance(soft) + .05) / (luminance(primary) + .05) < 1.5; step++) primary = mix(-step / 20);
+    }
+    return {
+      accent: base.join(','), icon: mix(light ? 0 : .28).join(','), wave: base.join(','),
+      primary: `rgb(${primary.join(',')})`, soft: `rgb(${soft.join(',')})`,
+      line: tone('#76daff', '#38bdf8').join(','), lineGlow: tone('#7957ff', '#38bdf8').join(','),
+      ribbon: ribbon.map(value => `rgb(${tone(value, '#e2a857').join(',')})`),
+    };
+  }
+
   function escapeHtml(value) {
     return String(value == null ? '' : value)
       .replace(/&/g, '&amp;')
@@ -102,10 +174,36 @@
     return classicIOS || iPadDesktopMode;
   }
 
+  function elapsedText(seconds) {
+    const value = Math.max(0, Math.floor(Number(seconds) || 0));
+    return `${Math.floor(value / 60)}:${String(value % 60).padStart(2, '0')}`;
+  }
+
+  function safeLink(value, hosts) {
+    try { const url = new URL(value); return url.protocol === 'https:' && (!hosts || hosts.includes(url.hostname)) ? url.href : ''; }
+    catch (_) { return ''; }
+  }
+
   function iosVolumeText() {
-    return window.matchMedia && window.matchMedia('(max-width: 540px)').matches
-      ? '기기 볼륨'
-      : '기기 볼륨 버튼으로 조절';
+    return '기기 볼륨';
+  }
+
+  function renderVolumeControls(els, snap) {
+    const noise = snap.noiseEnabled && snap.noiseControlsVisible;
+    const available = noise || !isIOSDevice();
+    const level = noise ? snap.noiseLevel : snap.volume;
+    els.volumeWrap.classList.toggle('is-ios', !available);
+    els.volume.parentElement.hidden = !available;
+    els.volume.hidden = !available;
+    els.volumeNote.hidden = available;
+    els.volumeNote.textContent = available ? '' : iosVolumeText();
+    els.volume.setAttribute('aria-label', noise ? 'LP 노이즈 강도' : '볼륨');
+    els.volume.value = String(level);
+    els.volume.style.setProperty('--jr-volume', `${level}%`);
+    els.volumeValue.hidden = !available || !(noise || snap.volumeControlsVisible);
+    els.volumeValue.textContent = noise
+      ? (snap.noiseValueVisible ? `LP 노이즈 ${level}%` : 'LP 노이즈')
+      : `${level}%`;
   }
 
   function createEngine() {
@@ -129,69 +227,64 @@
       document.head.appendChild(style);
     }
     style.textContent = `
-      #jazzradio-float-player .jrfp-disc{padding:0;border:0;color:inherit;cursor:pointer}
-      #jazzradio-float-player .jrfp-disc[aria-pressed="true"]{box-shadow:0 0 0 2px #eac482,0 0 12px #eac48255}
-      #jazzradio-float-player .jrfp-disc:focus-visible{outline:2px solid white;outline-offset:3px}
-      #jazzradio-float-player .jrfp-noise{display:flex;align-items:center;gap:8px;padding:0 12px 12px;color:#eac482;font-size:11px}
-      #jazzradio-float-player .jrfp-noise input{flex:1;min-width:0;accent-color:#eac482}
-      #jazzradio-float-player .jrfp-noise[hidden],#jazzradio-float-player.jrfp-collapsed .jrfp-noise{display:none!important}
+      #jazzradio-app,#jazzradio-float-player{--jr-ink:#f5f1e8;--jr-muted:#b7bec8;--jr-mute:#ff9b82;--jr-gold:#d6bd78;--jr-accent-rgb:84,178,220;--jr-icon-rgb:185,220,238;--jr-accent:rgb(var(--jr-accent-rgb));--jr-icon:rgb(var(--jr-icon-rgb));--jr-surface:rgba(14,18,34,.43);--jr-panel:rgba(17,21,34,.96);--jr-dock:rgba(17,20,28,.58);--jr-dock-solid:#171d28;--jr-line:rgba(225,233,242,.18);--jr-tooltip:#172232;--jr-page:#111621;--jr-wash-start:rgba(7,12,20,.72);--jr-wash-end:rgba(10,17,28,.24);--jr-wash-bottom:rgba(6,9,16,.82)}
+      #jazzradio-app[data-jazzradio-theme=light],#jazzradio-float-player[data-jazzradio-theme=light]{--jr-ink:#17263a;--jr-muted:#43546a;--jr-mute:#a43e28;--jr-gold:#846023;--jr-accent-rgb:36,109,144;--jr-icon-rgb:49,94,119;--jr-surface:rgba(255,252,245,.86);--jr-panel:rgba(250,247,240,.98);--jr-dock:rgba(248,246,240,.94);--jr-dock-solid:#f3f0e8;--jr-line:rgba(28,48,66,.24);--jr-tooltip:#ebe4d6;--jr-page:#f3f0e8;--jr-wash-start:rgba(248,246,240,.92);--jr-wash-end:rgba(248,246,240,.65);--jr-wash-bottom:rgba(248,246,240,.94)}
+      #jazzradio-app :where(div,span),#jazzradio-float-player :where(div,span){color:inherit}
 
-      #jazzradio-float-player .jrfp-viz{position:relative}
-      #jazzradio-float-player .jrfp-viz[data-mode="constellation"],#jazzradio-float-player .jrfp-viz[data-mode="particle"]{background:#000}
-      #jazzradio-float-player [data-jazzradio-power]{position:absolute;left:7.05%;top:51.2%;width:4.7%;height:30%;min-width:24px;min-height:24px;transform:translate(-50%,-50%);background:transparent;border:0;cursor:pointer;padding:0}
-      #jazzradio-float-player [data-jazzradio-power][hidden]{display:none!important}
-      #jazzradio-float-player [data-jazzradio-power]:focus-visible{outline:2px solid #fff;outline-offset:2px}
-
-      #jazzradio-float-player{position:fixed;right:calc(12px + env(safe-area-inset-right,0px));bottom:calc(12px + env(safe-area-inset-bottom,0px));width:360px;max-width:calc(100vw - 24px);z-index:999998;color:var(--app-text-primary,#f1f1f6);font-family:inherit;background:linear-gradient(145deg,rgba(21,22,32,.98),rgba(13,14,22,.98));border:1px solid rgba(255,255,255,.12);border-radius:16px;box-shadow:0 18px 50px rgba(0,0,0,.42);overflow:hidden;backdrop-filter:blur(16px);transition:width .2s ease,max-width .2s ease,height .2s ease,border-radius .2s ease}
-      #jazzradio-float-player[hidden]{display:none!important}
-      #jazzradio-float-player .jrfp-header{display:flex;align-items:center;justify-content:space-between;padding:8px 10px 7px 12px;background:rgba(255,255,255,.035);border-bottom:1px solid rgba(255,255,255,.06);font-size:12px;font-weight:800}
-      #jazzradio-float-player .jrfp-brand{display:flex;align-items:center;gap:7px}#jazzradio-float-player .jrfp-dot{width:7px;height:7px;border-radius:50%;background:#ff5368;box-shadow:0 0 0 4px rgba(255,83,104,.12)}
-      #jazzradio-float-player .jrfp-actions{display:flex;align-items:center;gap:2px}#jazzradio-float-player .jrfp-drag,#jazzradio-float-player .jazzradio-float-close{display:grid;place-items:center;width:30px;height:30px;border:0;border-radius:8px;background:transparent;color:inherit;cursor:pointer;font-size:14px}
-      #jazzradio-float-player .jrfp-drag{cursor:grab;touch-action:none}#jazzradio-float-player .jrfp-drag:active{cursor:grabbing;background:rgba(255,255,255,.08)}#jazzradio-float-player .jazzradio-float-close:hover{color:#ff7a89;background:rgba(255,80,100,.08)}
-      #jazzradio-float-player .jrfp-viz{box-sizing:border-box;height:80px;padding:0;background:linear-gradient(180deg,rgba(121,87,255,.08),transparent);cursor:pointer;touch-action:manipulation}#jazzradio-float-player .jrfp-viz:focus-visible{outline:1px solid rgba(139,92,246,.75);outline-offset:-2px}#jazzradio-float-player .jrfp-viz canvas{display:block;width:100%;height:100%;pointer-events:none}
-      #jazzradio-float-player .jrfp-body{display:flex;align-items:center;gap:10px;padding:10px 12px 12px}#jazzradio-float-player .jrfp-cover{position:relative;flex:0 0 56px;width:56px;height:56px;border-radius:10px;overflow:hidden;background:rgba(121,87,255,.18)}
-      #jazzradio-float-player .jrfp-cover img{width:100%;height:100%;object-fit:cover;display:block}#jazzradio-float-player .jrfp-cover img[hidden]{display:none!important}#jazzradio-float-player .jrfp-cover-placeholder{display:grid;place-items:center;width:100%;height:100%;font-size:21px;background:linear-gradient(145deg,rgba(123,89,255,.35),rgba(56,45,92,.58))}#jazzradio-float-player .jrfp-cover-placeholder[hidden]{display:none!important}
-      #jazzradio-float-player .jrfp-meta{min-width:0;flex:1 1 auto}#jazzradio-float-player .jrfp-artist{font-size:13px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#jazzradio-float-player .jrfp-title{margin-top:2px;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:.82}#jazzradio-float-player .jrfp-station{margin-top:3px;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:.5}
-      #jazzradio-float-player .jrfp-transport{display:flex;align-items:center;gap:7px;flex:0 0 auto}#jazzradio-float-player .jrfp-disc{display:grid;place-items:center;width:38px;height:38px;flex-shrink:0;box-sizing:border-box;border-radius:50%;font-size:18px;background:radial-gradient(circle,rgba(12,12,18,.95) 0 14%,rgba(121,87,255,.65) 15% 23%,rgba(45,37,72,.95) 24% 65%,rgba(121,87,255,.3) 66% 100%)}#jazzradio-float-player .jrfp-disc.playing i{animation:jazzradio-global-spin 2.8s linear infinite}
-      #jazzradio-float-player .jrfp-play{display:grid;place-items:center;flex-shrink:0;box-sizing:border-box;padding:0;width:38px;height:38px;border:0;border-radius:50%;background:#7957ff;color:#fff;cursor:pointer;font-size:13px;box-shadow:0 6px 18px rgba(121,87,255,.3)}
-      #jazzradio-float-player .jrfp-volume{display:flex;align-items:center;gap:8px;padding:0 12px 10px;font-size:11px;opacity:.78}#jazzradio-float-player .jrfp-volume input{min-width:0;flex:1 1 auto;accent-color:#7957ff}#jazzradio-float-player .jrfp-volume-value{width:35px;text-align:right;font-size:10px}#jazzradio-float-player .jrfp-volume-note{width:auto!important;white-space:nowrap;font-weight:700}
-      #jazzradio-float-player .jrfp-collapse,#jazzradio-float-player .jrfp-peek{display:none;place-items:center;border:0;background:transparent;color:inherit;cursor:pointer;touch-action:manipulation}
+      #jazzradio-float-player{position:fixed;inset:auto 0 0;width:100%;z-index:999998;color:var(--jr-ink);background:var(--jr-dock);border-top:1px solid var(--jr-line);box-shadow:0 -12px 50px #0004;backdrop-filter:blur(24px) saturate(1.2);-webkit-backdrop-filter:blur(24px) saturate(1.2);font-family:inherit;transition:transform .25s ease;box-sizing:border-box;padding-bottom:env(safe-area-inset-bottom,0px)}
+      #jazzradio-float-player[hidden],#jazzradio-float-player [hidden]{display:none!important}
+      #jazzradio-float-player *{box-sizing:border-box}#jazzradio-float-player button{cursor:pointer;color:inherit;font:inherit}#jazzradio-float-player button:focus-visible{outline:2px solid var(--jr-accent);outline-offset:3px}
+      #jazzradio-float-player .jrfp-body{display:grid;grid-template-columns:fit-content(346px) 246px minmax(160px,1fr);align-items:center;gap:22px;max-width:1600px;margin:auto;padding:18px 48px 13px}
+      #jazzradio-float-player .jrfp-bar{display:contents;gap:inherit}
+      #jazzradio-float-player .jrfp-home{display:flex;align-items:center;gap:inherit;min-width:0;padding:0;border:0;background:none;text-align:left;position:relative}#jazzradio-float-player .jrfp-home .jrfp-cover{display:block;flex-shrink:0}#jazzradio-float-player .jrfp-home .jrfp-meta{display:block;min-width:0}#jazzradio-float-player .jrfp-home .jrfp-meta>span{display:block}#jazzradio-float-player .jrfp-home::after{content:'Jazz Radio 홈 이동';position:absolute;z-index:3;left:0;bottom:calc(100% + 28px + env(safe-area-inset-bottom,0px));padding:6px 9px;border-radius:6px;background:var(--jr-tooltip);color:var(--jr-icon);font-size:11px;white-space:nowrap;opacity:0;transform:translateY(4px);transition:opacity .18s ease,transform .18s ease;pointer-events:none}#jazzradio-float-player .jrfp-home:hover::after,#jazzradio-float-player .jrfp-home:focus-visible::after{opacity:1;transform:translateY(0)}
+      #jazzradio-float-player .jrfp-cover{height:64px;width:64px;overflow:hidden;border-radius:6px;background:#292d36}#jazzradio-float-player .jrfp-cover img{display:block;width:100%;height:100%;object-fit:cover}#jazzradio-float-player .jrfp-cover-placeholder{display:grid;place-items:center;height:100%;font-size:24px;color:var(--jr-accent)}
+      #jazzradio-float-player .jrfp-meta{min-width:0}#jazzradio-float-player .jrfp-artist{font-size:12px;color:var(--jr-muted);margin-top:4px}#jazzradio-float-player .jrfp-title{font-size:15px;font-weight:600}#jazzradio-float-player .jrfp-artist,#jazzradio-float-player .jrfp-title,#jazzradio-float-player .jrfp-station{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#jazzradio-float-player .jrfp-station{font-size:11px;color:var(--jr-muted);margin-top:4px}
+      #jazzradio-float-player .jrfp-transport{display:flex;align-items:center;gap:12px}#jazzradio-float-player .jrfp-disc,#jazzradio-float-player .jrfp-play{display:grid;place-items:center;width:43px;height:43px;flex-shrink:0;padding:0;border:1px solid rgba(var(--jr-accent-rgb),0.267);border-radius:50%;background:transparent;font-size:14px}#jazzradio-float-player .jrfp-play{background:transparent;color:var(--jr-accent);border:2px solid var(--jr-accent)}#jazzradio-float-player .jrfp-disc{font-size:19px}#jazzradio-float-player .jrfp-disc[aria-pressed=true]{box-shadow:0 0 0 2px var(--jr-accent)}#jazzradio-float-player .jrfp-disc.playing i{animation:jazzradio-global-spin 3s linear infinite}
+      #jazzradio-float-player .jrfp-progress{position:absolute;top:-1px;left:0;right:0;height:3px;background:rgba(var(--jr-accent-rgb),.15);pointer-events:none;z-index:2}#jazzradio-float-player .jrfp-progress>span{display:block;height:100%;width:0;background:var(--jr-accent)}#jazzradio-float-player.jrfp-collapsed .jrfp-progress{visibility:hidden}
+      #jazzradio-float-player .jrfp-viz-panel,#jazzradio-float-player .jrfp-viz-clip{display:contents}#jazzradio-float-player .jrfp-visualizer-toggle{display:none}
+      #jazzradio-float-player .jrfp-viz{width:100%;max-width:700px;justify-self:start;height:var(--jrfp-cover-size);min-width:0;position:relative;cursor:pointer}#jazzradio-float-player .jrfp-viz canvas{display:block;width:100%;height:100%;pointer-events:none}#jazzradio-float-player [data-jazzradio-power]{position:absolute;left:7.05%;top:36%;width:4.7%;height:30%;min-width:18px;min-height:18px;transform:translate(-50%,-50%);border:0;background:transparent}
+      #jazzradio-float-player .jrfp-volume{display:flex;gap:8px;align-items:center;font-size:11px;min-width:0}#jazzradio-float-player .jrfp-volume input{width:100%;min-width:30px;accent-color:var(--jr-accent)}#jazzradio-float-player .jrfp-volume-value{font-size:9px;opacity:.6}#jazzradio-float-player .jrfp-volume-note{font-size:9px;white-space:nowrap}
+      #jazzradio-float-player .jrfp-actions{position:absolute;z-index:1;right:18px;top:7px;display:flex;gap:2px}#jazzradio-float-player .jrfp-actions button{display:grid;place-items:center;width:26px;height:26px;background:none;border:0;font-size:12px;color:rgba(var(--jr-icon-rgb),0.627)}#jazzradio-float-player .jrfp-actions button:hover{color:var(--jr-accent)}
+      #jazzradio-float-player .jrfp-peek{display:none;position:absolute;right:22px;top:-32px;height:32px;padding:0 15px;border-radius:10px 10px 0 0;border:1px solid rgba(var(--jr-accent-rgb),0.2);border-bottom:0;background:var(--jr-dock-solid);color:var(--jr-accent);font-size:10px}#jazzradio-float-player.jrfp-collapsed{transform:translateY(100%)}#jazzradio-float-player.jrfp-collapsed .jrfp-peek{display:block}
+      #jazzradio-float-player{--jrfp-cover-size:64px}
+      #jazzradio-app .jazzradio-range,#jazzradio-float-player .jazzradio-range{position:relative;display:flex;align-items:center;flex:1;min-width:30px}
+      #jazzradio-app .jazzradio-volume-wrap .jazzradio-range{max-width:100px}
+      #jazzradio-float-player .jrfp-controls{display:grid;grid-template-columns:98px minmax(0,1fr);gap:12px;align-items:center}
+      #jazzradio-float-player .jrfp-controls .jrfp-transport{grid-column:1}
+      #jazzradio-float-player .jrfp-controls .jrfp-volume{grid-column:2}
+      #jazzradio-app .jazzradio-mute,#jazzradio-float-player .jrfp-mute{display:grid;place-items:center;flex-shrink:0;width:24px;height:28px;padding:0;border:0;background:transparent;color:var(--jr-accent);font-size:13px;cursor:pointer}
+      #jazzradio-app .jazzradio-mute[aria-pressed=true],#jazzradio-float-player .jrfp-mute[aria-pressed=true]{color:var(--jr-mute)}
+      #jazzradio-app .jazzradio-volume-value,#jazzradio-float-player .jrfp-volume-value{position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);padding:3px 6px;border-radius:5px;opacity:1;background:var(--jr-tooltip);color:var(--jr-icon);font-size:10px;white-space:nowrap;pointer-events:none}
+      #jazzradio-app .jazzradio-range input,#jazzradio-float-player .jazzradio-range input{appearance:none;-webkit-appearance:none;background:transparent;height:24px;padding:0;margin:0;cursor:pointer;outline-offset:2px}
+      #jazzradio-app .jazzradio-range input::-webkit-slider-runnable-track,#jazzradio-float-player .jazzradio-range input::-webkit-slider-runnable-track{height:3px;border-radius:3px;background:linear-gradient(to right,var(--jr-accent) var(--jr-volume,70%),rgba(var(--jr-icon-rgb),0.2) var(--jr-volume,70%))}
+      #jazzradio-app .jazzradio-range input::-webkit-slider-thumb,#jazzradio-float-player .jazzradio-range input::-webkit-slider-thumb{appearance:none;-webkit-appearance:none;width:12px;height:12px;margin-top:-4.5px;border:2px solid var(--jr-icon);border-radius:50%;background:var(--jr-accent);box-shadow:0 0 0 2px rgba(var(--jr-accent-rgb),0.333)}
+      #jazzradio-app .jazzradio-range input::-moz-range-track,#jazzradio-float-player .jazzradio-range input::-moz-range-track{height:3px;background:rgba(var(--jr-icon-rgb),0.2);border-radius:3px}
+      #jazzradio-app .jazzradio-range input::-moz-range-progress,#jazzradio-float-player .jazzradio-range input::-moz-range-progress{height:3px;background:var(--jr-accent);border-radius:3px}
+      #jazzradio-app .jazzradio-range input::-moz-range-thumb,#jazzradio-float-player .jazzradio-range input::-moz-range-thumb{width:9px;height:9px;border:2px solid var(--jr-icon);border-radius:50%;background:var(--jr-accent)}
       @keyframes jazzradio-global-spin{to{transform:rotate(360deg)}}
-      @media(max-width:540px){#jazzradio-float-player{width:calc(100vw - 20px);max-width:calc(100vw - 20px);right:calc(10px + env(safe-area-inset-right,0px));bottom:calc(10px + env(safe-area-inset-bottom,0px))}#jazzradio-float-player .jrfp-collapse{display:grid;width:30px;height:30px;border-radius:8px;font-size:13px}#jazzradio-float-player .jrfp-collapse:active{background:rgba(255,255,255,.08)}#jazzradio-float-player.jrfp-collapsed{width:44px!important;max-width:44px!important;height:56px!important;min-height:56px;border-radius:14px 0 0 14px;overflow:hidden}#jazzradio-float-player.jrfp-collapsed .jrfp-header,#jazzradio-float-player.jrfp-collapsed .jrfp-viz,#jazzradio-float-player.jrfp-collapsed .jrfp-body,#jazzradio-float-player.jrfp-collapsed .jrfp-volume{display:none!important}#jazzradio-float-player.jrfp-collapsed .jrfp-peek{display:grid;width:44px;height:56px;background:linear-gradient(145deg,rgba(121,87,255,.78),rgba(45,37,72,.96));font-size:15px}#jazzradio-float-player.jrfp-collapsed .jrfp-peek:active{background:rgba(121,87,255,.9)}#jazzradio-float-player .jrfp-body{gap:8px;padding:9px 10px 10px}#jazzradio-float-player .jrfp-cover{flex-basis:52px;width:52px;height:52px}#jazzradio-float-player .jrfp-disc{width:36px;height:36px}#jazzradio-float-player .jrfp-play{width:36px;height:36px}#jazzradio-float-player .jrfp-volume{padding:0 10px 9px}}
+      @media(max-width:800px),(max-width:1200px) and (any-pointer:coarse){
+        #jazzradio-float-player{--jrfp-cover-size:58px;padding-bottom:0;border-top:0}#jazzradio-float-player .jrfp-body{display:flex;flex-direction:column;align-items:stretch;gap:0;padding:0}#jazzradio-float-player .jrfp-bar{position:relative;display:grid;order:0;border-top:1px solid var(--jr-line);padding:max(17.5px,env(safe-area-inset-bottom,0px)) 84px max(17.5px,env(safe-area-inset-bottom,0px)) 20px;grid-template-columns:minmax(0,1fr) auto;gap:10px}#jazzradio-float-player .jrfp-cover{width:58px;height:58px}
+        #jazzradio-float-player .jrfp-controls{display:flex;align-items:center;gap:10px}#jazzradio-float-player .jrfp-volume{width:100px;flex:none}
+        #jazzradio-float-player .jrfp-visualizer-toggle{display:grid;place-items:center;flex-shrink:0;width:36px;height:36px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--jr-icon);font-size:15px}#jazzradio-float-player .jrfp-visualizer-toggle[aria-pressed=false] i{opacity:.45}
+        #jazzradio-float-player .jrfp-viz-panel{display:grid;order:-1;width:100%;grid-template-rows:0fr;opacity:0;pointer-events:none;transition:grid-template-rows .32s ease,opacity .24s ease}#jazzradio-float-player .jrfp-viz-panel.is-open{grid-template-rows:1fr;opacity:1;pointer-events:auto}#jazzradio-float-player .jrfp-viz-clip{display:block;min-height:0;overflow:hidden;border-radius:12px 12px 0 0;background:transparent}#jazzradio-float-player[data-viz-position=below] .jrfp-viz-panel{order:1}#jazzradio-float-player .jrfp-viz{max-width:none;height:var(--jrfp-bar-height,124px)}#jazzradio-float-player.jrfp-collapsed .jrfp-viz-panel{grid-template-rows:0fr;opacity:0;pointer-events:none}
+      }
+      @media(max-width:540px){
+        #jazzradio-float-player{--jrfp-cover-size:56px}#jazzradio-float-player .jrfp-bar{padding:max(17px,env(safe-area-inset-bottom,0px)) 16px;grid-template-columns:minmax(0,1fr);gap:10px}#jazzradio-float-player .jrfp-home{grid-column:1;grid-row:1}#jazzradio-float-player .jrfp-cover{width:56px;height:56px}#jazzradio-float-player .jrfp-title{font-size:16px;line-height:20px}#jazzradio-float-player .jrfp-artist{font-size:12px;line-height:15px}#jazzradio-float-player .jrfp-station{font-size:11px;line-height:13px}
+        #jazzradio-float-player .jrfp-controls{grid-column:1;grid-row:2;display:flex;align-items:center;gap:10px;position:relative}#jazzradio-float-player .jrfp-transport{gap:9px}#jazzradio-float-player .jrfp-volume{flex:1;max-width:150px;gap:6px}#jazzradio-float-player .jrfp-volume-value{bottom:100%;line-height:12px;padding:1px 6px}
+        #jazzradio-float-player .jrfp-actions{right:14px;top:1px}
+      }
+      @media(hover:hover) and (pointer:fine){#jazzradio-float-player .jrfp-visualizer-toggle:hover{background:rgba(var(--jr-accent-rgb),0.11)}}
+      @media(prefers-reduced-motion:reduce){#jazzradio-float-player,#jazzradio-float-player *{animation:none!important;transition:none!important}}
     `;
-
     let floatRoot = document.getElementById('jazzradio-float-player');
     if (!floatRoot) {
       floatRoot = document.createElement('div');
       floatRoot.id = 'jazzradio-float-player';
       floatRoot.hidden = true;
       floatRoot.innerHTML = `
-        <div class="jrfp-header">
-          <div class="jrfp-brand"><span class="jrfp-dot"></span><span>Jazz Radio</span></div>
-          <div class="jrfp-actions">
-            <button type="button" class="jrfp-collapse" title="옆으로 숨기기" aria-label="플레이어 옆으로 숨기기" aria-expanded="true"><i class="fa-solid fa-chevron-right"></i></button>
-            <button type="button" class="jrfp-drag" title="플레이어 이동" aria-label="플레이어 이동"><i class="fa-solid fa-up-down-left-right"></i></button>
-            <button type="button" class="jazzradio-float-close" title="재생 종료" aria-label="재생 종료"><i class="fa-solid fa-xmark"></i></button>
-          </div>
-        </div>
-        <div class="jrfp-viz" role="group" tabindex="0" title="비주얼라이저 모드 변경" aria-label="비주얼라이저 모드 변경"><canvas data-jazzradio-visualizer="float" aria-hidden="true"></canvas><button type="button" data-jazzradio-power aria-label="라디오 재생" aria-pressed="false" hidden></button></div>
-        <div class="jrfp-body">
-          <div class="jrfp-cover"><img class="jrfp-cover-img" alt="" referrerpolicy="no-referrer" hidden><div class="jrfp-cover-placeholder"><i class="fa-solid fa-music"></i></div></div>
-          <div class="jrfp-meta"><div class="jrfp-artist">Jazz Radio</div><div class="jrfp-title">재생 대기 중</div><div class="jrfp-station"></div></div>
-          <div class="jrfp-transport"><button type="button" class="jrfp-disc" aria-label="LP 노이즈" aria-pressed="false"><i class="fa-solid fa-compact-disc" aria-hidden="true"></i></button><button type="button" class="jrfp-play" aria-label="재생"><i class="fa-solid fa-play"></i></button></div>
-        </div>
-        <div class="jrfp-volume"><i class="fa-solid fa-volume-low"></i><input class="jrfp-volume-range" type="range" min="0" max="100" step="1" value="70" aria-label="볼륨"><span class="jrfp-volume-value">70%</span><span class="jrfp-volume-note" hidden></span></div>
-        <label class="jrfp-noise" hidden>LP 노이즈 강도 <input type="range" min="0" max="100" step="1" value="30" aria-label="LP 노이즈 강도"><output>30%</output></label>
-        <button type="button" class="jrfp-peek" title="플레이어 펼치기" aria-label="플레이어 펼치기"><i class="fa-solid fa-chevron-left"></i></button>
-      `;
+        <div class="jrfp-body"><div class="jrfp-bar"><div class="jrfp-progress" data-jazzradio-track-progress="float" role="progressbar" aria-label="추정 곡 진행률" aria-valuemin="0" aria-valuemax="100"><span></span></div><div class="jrfp-actions"><button type="button" class="jrfp-collapse" aria-label="플레이어 아래로 접기" title="아래로 접기" aria-expanded="true"><i class="fa-solid fa-chevron-down"></i></button><button type="button" class="jazzradio-float-close" aria-label="라디오 종료" title="라디오 종료"><i class="fa-solid fa-xmark"></i></button></div><button type="button" class="jrfp-home" aria-label="Jazz Radio 홈 이동"><span class="jrfp-cover"><img class="jrfp-cover-img" alt="" referrerpolicy="no-referrer" hidden><span class="jrfp-cover-placeholder"><i class="fa-solid fa-record-vinyl"></i></span></span><span class="jrfp-meta"><span class="jrfp-title">Jazz Radio</span><span class="jrfp-artist">재생 대기 중</span><span class="jrfp-station"></span></span></button><div class="jrfp-controls"><div class="jrfp-transport"><button type="button" class="jrfp-disc" aria-label="LP 노이즈" aria-pressed="false"><i class="fa-solid fa-compact-disc"></i></button><button type="button" class="jrfp-play" aria-label="재생"><i class="fa-solid fa-play"></i></button></div><div class="jrfp-volume"><button type="button" class="jrfp-mute" aria-label="음소거" title="음소거" aria-pressed="false"><i class="fa-solid fa-volume-low" aria-hidden="true"></i></button><span class="jazzradio-range"><input class="jrfp-volume-range" type="range" min="0" max="100" value="70" aria-label="볼륨"><span class="jrfp-volume-value" hidden>70%</span></span><span class="jrfp-volume-note" hidden></span></div><button type="button" class="jrfp-visualizer-toggle" title="비주얼라이저 끄기" aria-label="비주얼라이저" aria-pressed="true" aria-expanded="true" aria-controls="jazzradio-float-viz-panel"><i class="fa-solid fa-chart-simple" aria-hidden="true"></i></button></div></div><div class="jrfp-viz-panel is-open" id="jazzradio-float-viz-panel"><div class="jrfp-viz-clip"><div class="jrfp-viz" role="group" tabindex="0" title="비주얼라이저 모드 변경" aria-label="비주얼라이저 모드 변경"><canvas data-jazzradio-visualizer="float" aria-hidden="true"></canvas><button type="button" data-jazzradio-power aria-label="라디오 재생" aria-pressed="false" hidden></button></div></div></div></div>
+        <button type="button" class="jrfp-peek" aria-label="플레이어 펼치기"><i class="fa-solid fa-chevron-up"></i> Jazz Radio</button>`;
       document.body.appendChild(floatRoot);
-    }
-    if (!floatRoot.querySelector('.jrfp-collapse')) {
-      const actions = floatRoot.querySelector('.jrfp-actions');
-      if (actions) actions.insertAdjacentHTML('afterbegin', '<button type="button" class="jrfp-collapse" title="옆으로 숨기기" aria-label="플레이어 옆으로 숨기기" aria-expanded="true"><i class="fa-solid fa-chevron-right"></i></button>');
-    }
-    if (!floatRoot.querySelector('.jrfp-peek')) {
-      floatRoot.insertAdjacentHTML('beforeend', '<button type="button" class="jrfp-peek" title="플레이어 펼치기" aria-label="플레이어 펼치기"><i class="fa-solid fa-chevron-left"></i></button>');
     }
 
     const state = {
@@ -202,19 +295,54 @@
       waiting: false,
       error: '',
       volume: 70,
+      muted: false,
+      volumeControlsVisible: false,
+      visualizerEnabled: true,
       noiseEnabled: storageGet('jazzradio.noise.enabled', 'false') === 'true',
       noiseControlsVisible: false,
+      noiseValueVisible: false,
       noiseLevel: Math.max(0, Math.min(100, Number(storageGet('jazzradio.noise.level', '30')) || 0)),
       visualizerMode: normalizeVisualizerMode(storageGet(STORAGE_VISUALIZER_MODE, 'spectrum')),
+      colorTheme: normalizeColorTheme(storageGet(STORAGE_COLOR_THEME, '')),
+      colorTone: normalizeColorTone(storageGet(STORAGE_COLOR_TONE, '100')),
+      dockVisualizerPosition: normalizeDockPosition(storageGet(STORAGE_DOCK_POSITION, 'above')),
     };
 
     const viewBindings = new Set();
+    let lightTheme = false;
+    let colorPalette = null;
+    const defaultRibbonColors = createColorPalette('#38bdf8', false).ribbon;
+    const themeProbe = document.createElement('span');
+    themeProbe.hidden = true;
+    themeProbe.style.backgroundColor = 'var(--app-bg-main,#111621)';
+    floatRoot.appendChild(themeProbe);
+    function syncTheme() {
+      const [red, green, blue] = getComputedStyle(themeProbe).backgroundColor.match(/[\d.]+/g).map(Number);
+      lightTheme = red * .299 + green * .587 + blue * .114 > 150;
+      const theme = lightTheme ? 'light' : 'dark';
+      colorPalette = createColorPalette(state.colorTheme, lightTheme, state.colorTone);
+      floatRoot.dataset.jazzradioTheme = theme;
+      applyColorTheme(floatRoot);
+      viewBindings.forEach(binding => { binding.root.dataset.jazzradioTheme = theme; applyColorTheme(binding.root); });
+      scheduleVisualizers();
+    }
+
+    function applyColorTheme(viewRoot) {
+      for (const [property, value] of [['--jr-accent-rgb', colorPalette && colorPalette.accent], ['--jr-icon-rgb', colorPalette && colorPalette.icon]]) {
+        if (value) viewRoot.style.setProperty(property, value);
+        else viewRoot.style.removeProperty(property);
+      }
+      viewRoot.querySelectorAll('.jrfp-disc').forEach(button => { button.style.color = colorPalette ? 'var(--jr-icon)' : ''; });
+    }
+
     let pollBusy = false;
     let audioContext = null;
     let previousIOSSessionType = null;
     let mediaSource = null;
     let noiseSource = null;
     let noiseControlsTimer = null;
+    let noiseValueTimer = null;
+    let volumeControlsTimer = null;
     let noiseGain = null;
     let removeNoiseContextListener = null;
     let analyser = null;
@@ -277,6 +405,7 @@
     }
 
     const floatEls = {
+      bar: floatRoot.querySelector('.jrfp-bar'),
       play: floatRoot.querySelector('.jrfp-play'),
       disc: floatRoot.querySelector('.jrfp-disc'),
       artist: floatRoot.querySelector('.jrfp-artist'),
@@ -284,6 +413,7 @@
       station: floatRoot.querySelector('.jrfp-station'),
       cover: floatRoot.querySelector('.jrfp-cover-img'),
       coverPlaceholder: floatRoot.querySelector('.jrfp-cover-placeholder'),
+      mute: floatRoot.querySelector('.jrfp-mute'),
       volume: floatRoot.querySelector('.jrfp-volume-range'),
       volumeValue: floatRoot.querySelector('.jrfp-volume-value'),
       volumeNote: floatRoot.querySelector('.jrfp-volume-note'),
@@ -291,13 +421,84 @@
       close: floatRoot.querySelector('.jazzradio-float-close'),
       collapse: floatRoot.querySelector('.jrfp-collapse'),
       peek: floatRoot.querySelector('.jrfp-peek'),
-      drag: floatRoot.querySelector('.jrfp-drag'),
       viz: floatRoot.querySelector('.jrfp-viz'),
+      vizPanel: floatRoot.querySelector('.jrfp-viz-panel'),
+      vizToggle: floatRoot.querySelector('.jrfp-visualizer-toggle'),
     };
+
+    const barSizeObserver = new ResizeObserver(entries => {
+      if (disposed) return;
+      const entry = entries[0], box = entry.borderBoxSize;
+      const height = box && (box[0] || box).blockSize || entry.target.getBoundingClientRect().height;
+      const value = `${height}px`;
+      if (height > 0 && floatRoot.style.getPropertyValue('--jrfp-bar-height') !== value) {
+        floatRoot.style.setProperty('--jrfp-bar-height', value);
+        scheduleVisualizers();
+      }
+    });
+    barSizeObserver.observe(floatEls.bar, {box: 'border-box'});
 
     function currentPlaying() {
       if (isIOSDevice()) return !!pcmJob && pcmJob.context.state === 'running' && pcmPlaybackTime(pcmJob) >= pcmJob.startedAt && pcmPlaybackTime(pcmJob) < pcmJob.nextAt && !state.error;
       return state.sessionStarted && !audio.paused && !audio.ended && audio.readyState >= 3 && !state.waiting && !state.error;
+    }
+
+    let trackObservation = null;
+    let lastProgressPlaying = performance.now();
+    function observeTrack(np) {
+      if (!np || !np.available || np.stale) { trackObservation = null; return; }
+      const now = performance.now();
+      if (trackObservation && now - trackObservation.confirmedAt > METADATA_POLL_MS * 2 + 10000) trackObservation = null;
+      const key = [np.station_id, np.artist, np.title || np.raw].join('|');
+      if (!trackObservation || trackObservation.key !== key) {
+        const previous = trackObservation;
+        const detectedChange = previous && previous.station === np.station_id && now - previous.confirmedAt <= METADATA_POLL_MS * 2 + 10000;
+        trackObservation = { key, station: np.station_id, startedAt: detectedChange ? (previous.confirmedAt + now) / 2 : null };
+      }
+      trackObservation.confirmedAt = now;
+      trackObservation.durationMs = Number.isFinite(np.duration_ms) && np.duration_ms > 0 ? np.duration_ms : 0;
+    }
+
+    function trackProgress() {
+      const durationMs = trackObservation ? trackObservation.durationMs : (state.nowPlaying && Number.isFinite(state.nowPlaying.duration_ms) ? Math.max(0, state.nowPlaying.duration_ms) : 0);
+      const estimated = !!trackObservation && performance.now() - trackObservation.confirmedAt <= METADATA_POLL_MS * 2 + 10000 && trackObservation.startedAt !== null && durationMs > 0;
+      return { estimated, durationMs, elapsedMs: estimated ? Math.min(durationMs, Math.max(0, performance.now() - trackObservation.startedAt)) : 0 };
+    }
+
+    function updateTrackProgress() {
+      const progress = trackProgress();
+      document.querySelectorAll('[data-jazzradio-track-progress]').forEach(bar => {
+        bar.classList.toggle('is-estimated', progress.estimated);
+        const width = progress.estimated ? `${progress.elapsedMs / progress.durationMs * 100}%` : bar.dataset.jazzradioTrackProgress === 'float' ? '0%' : '100%';
+        if (bar.firstElementChild.style.width !== width) bar.firstElementChild.style.width = width;
+        if (progress.estimated) bar.setAttribute('aria-valuenow', String(Math.round(progress.elapsedMs / progress.durationMs * 100)));
+        else bar.removeAttribute('aria-valuenow');
+        bar.setAttribute('aria-valuetext', progress.estimated ? `${elapsedText(progress.elapsedMs / 1000)} / ${elapsedText(progress.durationMs / 1000)} 추정` : '현재 곡 위치 미확인');
+      });
+      document.querySelectorAll('[data-jazzradio-track-time]').forEach(el => {
+        el.hidden = !progress.estimated;
+        const text = progress.estimated ? elapsedText(progress.elapsedMs / 1000) : '';
+        if (el.textContent !== text) el.textContent = text;
+      });
+      document.querySelectorAll('[data-jazzradio-track-total]').forEach(el => {
+        el.hidden = !progress.durationMs;
+        const text = progress.durationMs ? `${elapsedText(progress.durationMs / 1000)} · ${progress.estimated ? '추정' : '곡 길이'}${progress.estimated && progress.elapsedMs === progress.durationMs ? ' · 다음 곡 확인 중' : ''}` : '';
+        if (el.textContent !== text) el.textContent = text;
+      });
+      document.querySelectorAll('[data-jazzradio-listen-time]').forEach(el => { el.hidden = progress.estimated; });
+    }
+
+    let listenedMs = 0;
+    let lastListenTick = performance.now();
+    function updateListenTime() {
+      const now = performance.now();
+      if (currentPlaying()) listenedMs += Math.max(0, now - lastListenTick);
+      lastListenTick = now;
+      if (currentPlaying()) lastProgressPlaying = now;
+      else if (now - lastProgressPlaying > 3000) trackObservation = null;
+      if (trackObservation && now - trackObservation.confirmedAt > METADATA_POLL_MS * 2 + 10000) trackObservation = null;
+      updateTrackProgress();
+      document.querySelectorAll('[data-jazzradio-elapsed]').forEach(el => { const text = elapsedText(listenedMs / 1000); if (el.textContent !== text) el.textContent = text; });
     }
 
     function snapshot() {
@@ -309,11 +510,20 @@
         waiting: isIOSDevice() ? !!pcmJob && !currentPlaying() : state.waiting,
         error: state.error,
         playing: currentPlaying(),
+        elapsedSeconds: Math.floor(listenedMs / 1000),
+        trackProgress: trackProgress(),
         volume: state.volume,
+        muted: state.muted,
+        volumeControlsVisible: state.volumeControlsVisible,
+        visualizerEnabled: state.visualizerEnabled,
         noiseEnabled: state.noiseEnabled,
         noiseControlsVisible: state.noiseControlsVisible,
+        noiseValueVisible: state.noiseValueVisible,
         noiseLevel: state.noiseLevel,
         visualizerMode: state.visualizerMode,
+        colorTheme: state.colorTheme,
+        colorTone: state.colorTone,
+        dockVisualizerPosition: state.dockVisualizerPosition,
         analysisStatus,
       };
     }
@@ -369,10 +579,14 @@
       const changed = floatRoot.hidden === shouldShow;
       floatRoot.hidden = !shouldShow;
       if (changed) scheduleVisualizers();
-      if (shouldShow && !floatCollapsed) restoreOrClampFloatPosition();
+      if (shouldShow) viewBindings.forEach(binding => {
+        const dialog = binding.root.querySelector('dialog[open]');
+        if (dialog) dialog.close();
+      });
     }
 
     function renderFloat() {
+      floatRoot.dataset.vizPosition = state.dockVisualizerPosition;
       const station = state.selectedStation;
       const np = state.nowPlaying;
       const playing = currentPlaying();
@@ -382,34 +596,29 @@
       floatEls.disc.classList.toggle('playing', playing);
       floatEls.disc.setAttribute('aria-pressed', String(state.noiseEnabled));
       floatEls.disc.title = state.noiseEnabled ? 'LP 노이즈 끄기' : 'LP 노이즈 켜기';
-      const noiseControls = floatRoot.querySelector('.jrfp-noise');
-      noiseControls.hidden = !state.noiseEnabled || !state.noiseControlsVisible;
-      noiseControls.querySelector('input').value = String(state.noiseLevel);
-      noiseControls.querySelector('output').textContent = `${state.noiseLevel}%`;
       floatEls.viz.dataset.mode = state.visualizerMode;
+      floatEls.vizPanel.classList.toggle('is-open', state.visualizerEnabled);
+      floatEls.vizPanel.inert = !state.visualizerEnabled || floatRoot.classList.contains('jrfp-collapsed');
+      floatEls.vizToggle.setAttribute('aria-pressed', String(state.visualizerEnabled));
+      floatEls.vizToggle.setAttribute('aria-expanded', String(state.visualizerEnabled));
+      floatEls.vizToggle.title = state.visualizerEnabled ? '비주얼라이저 끄기' : '비주얼라이저 켜기';
       const power = floatRoot.querySelector('[data-jazzradio-power]');
-      power.hidden = state.visualizerMode !== 'tube';
+      power.hidden = !state.visualizerEnabled || state.visualizerMode !== 'tube';
+      floatEls.viz.querySelector('canvas').hidden = !state.visualizerEnabled;
+      floatEls.viz.tabIndex = state.visualizerEnabled ? 0 : -1;
+      floatEls.mute.setAttribute('aria-pressed', String(state.muted));
+      floatEls.mute.setAttribute('aria-label', state.muted ? '음소거 해제' : '음소거');
+      floatEls.mute.title = state.muted ? '음소거 해제' : '음소거';
+      floatEls.mute.innerHTML = `<i class="fa-solid fa-volume-${state.muted ? 'xmark' : 'low'}" aria-hidden="true"></i>`;
       power.disabled = !station;
       power.setAttribute('aria-pressed', String(playing));
       power.setAttribute('aria-label', playing ? '라디오 일시정지' : '라디오 재생');
       floatEls.artist.textContent = np && np.available === true ? (np.artist || (station && station.name) || 'Jazz Radio') : ((station && station.name) || 'Jazz Radio');
       floatEls.title.textContent = np && np.available === true ? (np.title || np.raw || '곡명 정보 없음') : (state.waiting ? '곡 정보 불러오는 중…' : '재생 중인 곡 정보가 없습니다.');
-      floatEls.station.textContent = station ? `${station.name} · ${station.quality || ''}` : '';
+      floatEls.station.textContent = np && np.available ? np.album_name || '' : '';
+      floatRoot.querySelector('.jrfp-home').setAttribute('aria-label', [floatEls.title.textContent, floatEls.artist.textContent, floatEls.station.textContent, 'Jazz Radio 홈 이동'].filter(Boolean).join(' · '));
       applyArtwork(floatEls.cover, floatEls.coverPlaceholder, np && np.album_art, np && np.artist ? `${np.artist} 앨범 커버` : '앨범 커버');
-      if (isIOSDevice()) {
-        floatEls.volumeWrap.classList.add('is-ios');
-        floatEls.volume.hidden = true;
-        floatEls.volumeValue.hidden = true;
-        floatEls.volumeNote.hidden = false;
-        floatEls.volumeNote.textContent = iosVolumeText();
-      } else {
-        floatEls.volumeWrap.classList.remove('is-ios');
-        floatEls.volume.hidden = false;
-        floatEls.volumeValue.hidden = false;
-        floatEls.volumeNote.hidden = true;
-        floatEls.volume.value = String(state.volume);
-        floatEls.volumeValue.textContent = `${state.volume}%`;
-      }
+      renderVolumeControls(floatEls, state);
       syncFloatVisibility();
     }
 
@@ -423,6 +632,7 @@
         }
       });
       renderFloat();
+      updateTrackProgress();
       scheduleVisualizers();
     }
 
@@ -448,7 +658,7 @@
 
     function syncNoise() {
       const volume = isIOSDevice() ? 1 : state.volume / 100;
-      if (disposed || !state.noiseEnabled || !state.noiseLevel || !volume || !currentPlaying() || !audioContext || audioContext.state !== 'running') {
+      if (disposed || state.muted || !state.noiseEnabled || !state.noiseLevel || !volume || !currentPlaying() || !audioContext || audioContext.state !== 'running') {
         stopNoise();
         return;
       }
@@ -483,7 +693,10 @@
       }
     }
 
-    function refreshNoiseControls() {
+    function refreshNoiseControls(showValue = false) {
+      window.clearTimeout(noiseValueTimer);
+      state.noiseValueVisible = state.noiseEnabled && showValue;
+      if (state.noiseValueVisible) noiseValueTimer = window.setTimeout(() => { state.noiseValueVisible = false; emit(); }, 2000);
       window.clearTimeout(noiseControlsTimer);
       noiseControlsTimer = null;
       state.noiseControlsVisible = state.noiseEnabled;
@@ -510,7 +723,7 @@
       if (!Number.isFinite(value)) return;
       state.noiseLevel = Math.max(0, Math.min(100, Math.round(value)));
       storageSet('jazzradio.noise.level', state.noiseLevel);
-      refreshNoiseControls();
+      refreshNoiseControls(true);
       emit();
     }
 
@@ -519,10 +732,34 @@
       if (!Number.isFinite(value)) value = 70;
       value = Math.max(0, Math.min(100, Math.round(value)));
       state.volume = value;
+      window.clearTimeout(volumeControlsTimer);
+      state.volumeControlsVisible = true;
+      volumeControlsTimer = window.setTimeout(() => { state.volumeControlsVisible = false; emit(); }, 2000);
       if (!isIOSDevice()) {
         audio.volume = value / 100;
         storageSet(STORAGE_VOLUME, value);
       }
+      emit();
+    }
+
+    function adjustVolume(raw) {
+      if (state.noiseEnabled && state.noiseControlsVisible) setNoiseLevel(raw);
+      else setVolume(raw);
+    }
+
+    function toggleMuted() {
+      state.muted = !state.muted;
+      audio.muted = state.muted;
+      if (pcmJob && pcmJob.startedAt) {
+        const now = pcmJob.context.currentTime;
+        pcmJob.gain.gain.cancelScheduledValues(now);
+        pcmJob.gain.gain.setTargetAtTime(state.muted ? 0 : 1, Math.max(now, pcmJob.startedAt), .015);
+      }
+      emit();
+    }
+
+    function toggleVisualizer() {
+      state.visualizerEnabled = !state.visualizerEnabled;
       emit();
     }
 
@@ -531,6 +768,32 @@
       if (state.visualizerMode === mode) return;
       state.visualizerMode = mode;
       storageSet(STORAGE_VISUALIZER_MODE, mode);
+      emit();
+    }
+
+    function setColorTheme(value) {
+      const color = normalizeColorTheme(value);
+      if (color === state.colorTheme) return;
+      state.colorTheme = color;
+      storageSet(STORAGE_COLOR_THEME, color);
+      syncTheme();
+      emit();
+    }
+
+    function setColorTone(value) {
+      const tone = normalizeColorTone(value);
+      if (tone === state.colorTone) return;
+      state.colorTone = tone;
+      storageSet(STORAGE_COLOR_TONE, tone);
+      syncTheme();
+      emit();
+    }
+
+    function setDockVisualizerPosition(value) {
+      const position = normalizeDockPosition(value);
+      if (position === state.dockVisualizerPosition) return;
+      state.dockVisualizerPosition = position;
+      storageSet(STORAGE_DOCK_POSITION, position);
       emit();
     }
 
@@ -671,7 +934,7 @@
               gain.gain.cancelScheduledValues(context.currentTime);
               gain.gain.setValueAtTime(0, context.currentTime);
               gain.gain.setValueAtTime(0, job.startedAt);
-              gain.gain.linearRampToValueAtTime(1, job.startedAt + .015);
+              gain.gain.linearRampToValueAtTime(state.muted ? 0 : 1, job.startedAt + .015);
             }
             const at = job.nextAt;
             job.nodes.add(source);
@@ -757,6 +1020,7 @@
         if (disposed || request.signal.aborted || !state.sessionStarted || state.selectedStation.id !== station.id) return;
         const np = data && data.now_playing;
         state.nowPlaying = np && np.station_id === station.id && np.available === true ? np : null;
+        observeTrack(state.nowPlaying);
         emit();
       } catch (error) {
         if (error.name !== 'AbortError') console.warn('[jazzradio] now playing load failed:', error);
@@ -853,8 +1117,11 @@
     }
 
     async function play() {
+      trackObservation = null;
+      lastProgressPlaying = performance.now();
       const station = state.selectedStation;
       if (!station) return;
+      lastListenTick = performance.now();
       const revision = ++playRevision;
       stopPCMPlayback();
       pcmError = '';
@@ -897,6 +1164,8 @@
     }
 
     function pause() {
+      updateListenTime();
+      trackObservation = null;
       playRevision += 1;
       state.waiting = false;
       stopPCMPlayback();
@@ -912,6 +1181,9 @@
     }
 
     function stop() {
+      updateListenTime();
+      trackObservation = null;
+      listenedMs = 0;
       playRevision += 1;
       stopPCMPlayback();
       pcmError = '';
@@ -935,7 +1207,7 @@
       const changed = !state.selectedStation || state.selectedStation.id !== station.id;
       state.selectedStation = station;
       storageSet(STORAGE_STATION, station.id);
-      if (changed) { stopPCMPlayback(); pcmError = ''; cancelMetadata(); state.nowPlaying = null; }
+      if (changed) { trackObservation = null; listenedMs = 0; lastListenTick = performance.now(); stopPCMPlayback(); pcmError = ''; cancelMetadata(); state.nowPlaying = null; }
       state.error = '';
       if (autoplay) play();
       else emit();
@@ -943,11 +1215,11 @@
 
     if (!isIOSDevice()) {
       listen(audio, 'ended', () => { stopPCMPlayback(); emit(); });
-      listen(audio, 'volumechange', () => { if (!isIOSDevice()) state.volume = audio.volume * 100; emit(); });
+      listen(audio, 'volumechange', () => { state.volume = Math.round(audio.volume * 100); state.muted = audio.muted; emit(); });
       listen(audio, 'play', () => { emit(); });
       listen(audio, 'pause', () => {
         // A source change can queue this event after the new connection has started.
-        if (audio.paused) { stopPCMPlayback(); stopNoise(); }
+        if (audio.paused) { trackObservation = null; stopPCMPlayback(); stopNoise(); }
         emit();
       });
       listen(audio, 'playing', () => { resumeAudioContext(); state.waiting = false; state.error = ''; emit(); refreshNowPlaying(); });
@@ -963,13 +1235,15 @@
     }
 
     listen(floatEls.disc, 'click', toggleNoise);
-    listen(floatRoot.querySelector('.jrfp-noise input'), 'input', event => setNoiseLevel(event.target.value));
     listen(floatEls.play, 'click', toggle);
+    listen(floatEls.vizToggle, 'click', toggleVisualizer);
     listen(floatEls.close, 'click', stop);
-    listen(floatEls.volume, 'input', () => setVolume(floatEls.volume.value));
+    listen(floatEls.mute, 'click', toggleMuted);
+    listen(floatEls.volume, 'input', () => adjustVolume(floatEls.volume.value));
     const floatViz = floatEls.viz;
     if (floatViz) {
       listen(floatViz, 'click', event => {
+        if (!state.visualizerEnabled) return;
         if (event.target.closest('[data-jazzradio-power]')) toggle();
         else cycleVisualizerMode();
       });
@@ -982,126 +1256,25 @@
       });
     }
 
-    function viewportSize() {
-      const vv = window.visualViewport;
-      return { width: vv ? vv.width : window.innerWidth, height: vv ? vv.height : window.innerHeight };
-    }
-
     let floatCollapsed = false;
-    let floatExpandedPosition = null;
-
-    function isPhoneViewport() {
-      return viewportSize().width <= 540;
-    }
-
     function setFloatCollapsed(collapsed) {
-      const next = Boolean(collapsed);
-      if (next && !isPhoneViewport()) return;
-      if (next === floatCollapsed) return;
-
-      if (next) {
-        const rect = floatRoot.getBoundingClientRect();
-        const viewport = viewportSize();
-        floatExpandedPosition = {
-          left: floatRoot.style.left, right: floatRoot.style.right,
-          top: floatRoot.style.top, bottom: floatRoot.style.bottom,
-        };
-        const maxTop = Math.max(4, viewport.height - 60);
-        floatRoot.style.left = 'auto';
-        floatRoot.style.right = 'calc(8px + env(safe-area-inset-right, 0px))';
-        floatRoot.style.bottom = 'auto';
-        floatRoot.style.top = `${Math.min(Math.max(4, rect.top), maxTop)}px`;
-      } else if (floatExpandedPosition) {
-        floatRoot.style.left = floatExpandedPosition.left;
-        floatRoot.style.right = floatExpandedPosition.right;
-        floatRoot.style.top = floatExpandedPosition.top;
-        floatRoot.style.bottom = floatExpandedPosition.bottom;
-        floatExpandedPosition = null;
-      }
-
-      floatCollapsed = next;
-      floatRoot.classList.toggle('jrfp-collapsed', next);
-      floatEls.collapse.setAttribute('aria-expanded', String(!next));
+      floatCollapsed = Boolean(collapsed);
+      floatRoot.classList.toggle('jrfp-collapsed', floatCollapsed);
+      floatEls.collapse.setAttribute('aria-expanded', String(!floatCollapsed));
+      floatEls.vizPanel.inert = floatCollapsed || !state.visualizerEnabled;
     }
-
     listen(floatEls.collapse, 'click', () => setFloatCollapsed(true));
     listen(floatEls.peek, 'click', () => setFloatCollapsed(false));
-
-    function clampFloat(left, top) {
-      const viewport = viewportSize();
-      const maxX = Math.max(4, viewport.width - floatRoot.offsetWidth - 4);
-      const maxY = Math.max(4, viewport.height - floatRoot.offsetHeight - 4);
-      return {
-        left: Math.min(Math.max(4, left), maxX),
-        top: Math.min(Math.max(4, top), maxY),
-      };
-    }
-
-    function persistFloatPosition(left, top) {
-      storageSet(STORAGE_FLOAT_POS, JSON.stringify({ left: Math.round(left), top: Math.round(top) }));
-    }
-
-    function restoreOrClampFloatPosition() {
-      if (floatRoot.hidden || floatCollapsed) return;
-      const raw = storageGet(STORAGE_FLOAT_POS, '');
-      if (!raw) return;
-      try {
-        const saved = JSON.parse(raw);
-        if (!Number.isFinite(Number(saved.left)) || !Number.isFinite(Number(saved.top))) return;
-        const pos = clampFloat(Number(saved.left), Number(saved.top));
-        floatRoot.style.right = 'auto';
-        floatRoot.style.bottom = 'auto';
-        floatRoot.style.left = `${pos.left}px`;
-        floatRoot.style.top = `${pos.top}px`;
-      } catch (_) { /* ignore invalid position */ }
-    }
-
-    let dragging = false;
-    let dragPointerId = null;
-    let dragOffsetX = 0;
-    let dragOffsetY = 0;
-    listen(floatEls.drag, 'pointerdown', (event) => {
-      if (floatRoot.hidden) return;
-      dragging = true;
-      dragPointerId = event.pointerId;
-      const rect = floatRoot.getBoundingClientRect();
-      dragOffsetX = event.clientX - rect.left;
-      dragOffsetY = event.clientY - rect.top;
-      floatRoot.style.right = 'auto';
-      floatRoot.style.bottom = 'auto';
-      floatRoot.style.left = `${rect.left}px`;
-      floatRoot.style.top = `${rect.top}px`;
-      try { floatEls.drag.setPointerCapture(event.pointerId); } catch (_) { /* ignore */ }
-      event.preventDefault();
+    listen(floatRoot.querySelector('.jrfp-home'), 'click', async () => {
+      setFloatCollapsed(false);
+      const menu = document.querySelector('.menu-item[data-plugin-id="jazzradio"],li[data-plugin-id="jazzradio"]');
+      if (menu) menu.click();
+      else {
+        try { const view = await import('/static/js/plugin_custom_view.js'); await view.mountCategoryPluginUI('jazzradio'); }
+        catch (error) { console.warn('[jazzradio] home navigation failed:', error); }
+      }
     });
-    listen(window, 'pointermove', (event) => {
-      if (!dragging || event.pointerId !== dragPointerId) return;
-      const pos = clampFloat(event.clientX - dragOffsetX, event.clientY - dragOffsetY);
-      floatRoot.style.left = `${pos.left}px`;
-      floatRoot.style.top = `${pos.top}px`;
-      event.preventDefault();
-    }, { passive: false });
-    function endDrag(event) {
-      if (!dragging || (event && event.pointerId !== dragPointerId)) return;
-      dragging = false;
-      dragPointerId = null;
-      const rect = floatRoot.getBoundingClientRect();
-      const pos = clampFloat(rect.left, rect.top);
-      floatRoot.style.left = `${pos.left}px`;
-      floatRoot.style.top = `${pos.top}px`;
-      persistFloatPosition(pos.left, pos.top);
-    }
-    listen(window, 'pointerup', endDrag);
-    listen(window, 'pointercancel', endDrag);
-    listen(window, 'resize', () => {
-      if (floatCollapsed && !isPhoneViewport()) setFloatCollapsed(false);
-      else if (!floatRoot.hidden && floatRoot.style.left) restoreOrClampFloatPosition();
-      emit();
-    });
-    if (window.visualViewport) listen(window.visualViewport, 'resize', () => {
-      if (floatCollapsed && !isPhoneViewport()) setFloatCollapsed(false);
-      else if (!floatRoot.hidden) restoreOrClampFloatPosition();
-    });
+    listen(window, 'resize', () => { scheduleVisualizers(); });
 
     function visualizerLevel(values, index, count, fallback, playing) {
       if (!playing) return 0.08;
@@ -1117,10 +1290,10 @@
     }
 
     function visualizerGradient(ctx, height) {
-      const gradient = ctx.createLinearGradient(0, height, 0, 0);
-      gradient.addColorStop(0, 'rgba(121,87,255,.88)');
-      gradient.addColorStop(.55, 'rgba(177,112,255,.92)');
-      gradient.addColorStop(1, 'rgba(90,221,255,.9)');
+      const gradient = ctx.createLinearGradient(0, 0, 0, height);
+      gradient.addColorStop(0, colorPalette ? colorPalette.primary : '#38bdf8');
+      gradient.addColorStop(.5, colorPalette ? colorPalette.soft : '#bae6fd');
+      gradient.addColorStop(1, colorPalette ? colorPalette.primary : '#38bdf8');
       return gradient;
     }
 
@@ -1150,11 +1323,7 @@
       const barWidth = Math.max(2 * dpr, (width - gap * (bars - 1)) / bars);
       const center = height / 2;
       const usableHalf = Math.max(3 * dpr, center - 6 * dpr);
-      const gradient = ctx.createLinearGradient(0, 0, 0, height);
-      gradient.addColorStop(0, '#38bdf8');
-      gradient.addColorStop(.5, '#bae6fd');
-      gradient.addColorStop(1, '#38bdf8');
-      ctx.fillStyle = gradient;
+      ctx.fillStyle = visualizerGradient(ctx, height);
       for (let i = 0; i < bars; i += 1) {
         const level = visualizerLevel(values, i, bars, fallback, playing);
         const halfHeight = Math.max(1.5 * dpr, usableHalf * level);
@@ -1184,11 +1353,11 @@
         const y = baseline - (usable * level);
         if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       }
-      ctx.strokeStyle = 'rgba(118,218,255,.96)';
+      ctx.strokeStyle = colorPalette ? `rgba(${colorPalette.line},.96)` : 'rgba(118,218,255,.96)';
       ctx.lineWidth = Math.max(1.5 * dpr, 2);
       ctx.lineJoin = 'round';
       ctx.lineCap = 'round';
-      ctx.shadowColor = 'rgba(121,87,255,.55)';
+      ctx.shadowColor = colorPalette ? `rgba(${colorPalette.lineGlow},.55)` : 'rgba(121,87,255,.55)';
       ctx.shadowBlur = 6 * dpr;
       ctx.stroke();
       ctx.shadowBlur = 0;
@@ -1212,11 +1381,12 @@
         const y = center - (normalized * amplitude);
         if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       }
-      ctx.strokeStyle = playing ? 'rgba(177,112,255,.96)' : 'rgba(177,112,255,.32)';
+      const color = colorPalette ? colorPalette.wave : lightTheme ? '36,109,144' : '84,178,220';
+      ctx.strokeStyle = `rgba(${color},${playing ? .96 : .32})`;
       ctx.lineWidth = Math.max(1.5 * dpr, 2);
       ctx.lineJoin = 'round';
       ctx.lineCap = 'round';
-      ctx.shadowColor = 'rgba(90,221,255,.45)';
+      ctx.shadowColor = `rgba(${color},.45)`;
       ctx.shadowBlur = playing ? 5 * dpr : 0;
       ctx.stroke();
       ctx.shadowBlur = 0;
@@ -1224,7 +1394,7 @@
 
     function drawRibbon(ctx, width, height, dpr, values, fallback, playing) {
       const phase = visualizerFrame * .014;
-      const colors = ['#82563c', '#b97b4b', '#e2a857', '#ffe0a0', '#ecc683', '#bcb995'];
+      const colors = colorPalette ? colorPalette.ribbon : defaultRibbonColors;
       ctx.save();
       ctx.lineWidth = 1.2 * dpr;
       ctx.lineJoin = 'round';
@@ -1278,8 +1448,7 @@
       const reflect = value => 1 - Math.abs(((value % 2 + 2) % 2) - 1);
       const nodes = [];
       ctx.save();
-      ctx.fillStyle = '#000';
-      ctx.fillRect(0, 0, width, height);
+
       for (let i = 0; i < count; i++) {
         const particle = particles[i];
         const time = particle.motion * (connected ? .7 : 1.15);
@@ -1528,13 +1697,20 @@
     function attachView(viewRoot, render) {
       const binding = { root: viewRoot, render };
       viewBindings.add(binding);
+      viewRoot.dataset.jazzradioTheme = lightTheme ? 'light' : 'dark';
+      applyColorTheme(viewRoot);
       render(snapshot());
+      updateTrackProgress();
       syncFloatVisibility();
       return function detach() { viewBindings.delete(binding); syncFloatVisibility(); };
     }
 
+    const themeObserver = new MutationObserver(syncTheme);
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-app-theme', 'style'] });
+    syncTheme();
     const observer = new MutationObserver(() => syncFloatVisibility());
     observer.observe(document.body, { childList: true, subtree: true });
+    const listenTimer = window.setInterval(updateListenTime, 250);
     const metadataTimer = window.setInterval(() => {
       if (currentPlaying()) refreshNowPlaying();
     }, METADATA_POLL_MS);
@@ -1561,10 +1737,15 @@
       stop();
       disposed = true;
       window.clearTimeout(noiseControlsTimer);
+      window.clearTimeout(volumeControlsTimer);
+      window.clearTimeout(noiseValueTimer);
       window.cancelAnimationFrame(frameId);
+      window.clearInterval(listenTimer);
       window.clearInterval(metadataTimer);
       window.clearInterval(visibilityTimer);
       observer.disconnect();
+      themeObserver.disconnect();
+      barSizeObserver.disconnect();
       listeners.forEach(remove => remove());
       viewBindings.clear();
       tubeImage.onload = null;
@@ -1613,9 +1794,15 @@
       toggle,
       stop,
       setVolume,
+      adjustVolume,
+      toggleMuted,
+      toggleVisualizer,
       toggleNoise,
       setNoiseLevel,
       setVisualizerMode,
+      setColorTheme,
+      setColorTone,
+      setDockVisualizerPosition,
       cycleVisualizerMode,
       refreshNowPlaying,
       syncFloatVisibility,
@@ -1643,6 +1830,7 @@
   const volume = root.querySelector('#jazzradio-volume');
   const volumeValue = root.querySelector('#jazzradio-volume-value');
   const volumeNote = root.querySelector('#jazzradio-volume-note');
+  const volumeControls = { volumeWrap, volume, volumeValue, volumeNote };
   const nowArtist = root.querySelector('#jazzradio-now-artist');
   const nowTitle = root.querySelector('#jazzradio-now-title');
   const nowQuality = root.querySelector('#jazzradio-now-quality');
@@ -1653,54 +1841,356 @@
   const coverImg = root.querySelector('#jazzradio-cover-img');
   const coverPlaceholder = root.querySelector('#jazzradio-cover-placeholder');
 
+  const coverButton = root.querySelector('#jazzradio-cover');
+  const recordLabel = root.querySelector('.jazzradio-turntable-label');
+  let preferTurntable = false;
+
+  function renderCover() {
+    const src = coverImg.getAttribute('src');
+    const available = !!src && coverImg.dataset.failedUrl !== src && coverImg.complete && coverImg.naturalWidth > 0;
+    if (available && recordLabel.getAttribute('src') !== src) recordLabel.src = src;
+    else if (!available) recordLabel.removeAttribute('src');
+    recordLabel.hidden = !available || !recordLabel.complete || recordLabel.naturalWidth === 0;
+    const turntable = preferTurntable || !available;
+    coverImg.hidden = turntable;
+    coverPlaceholder.hidden = !turntable;
+    coverButton.disabled = !available;
+    coverButton.setAttribute('aria-pressed', String(turntable));
+    const label = available ? (turntable ? '앨범 커버로 전환' : '턴테이블로 전환') : '앨범 커버 없음 · 턴테이블';
+    coverButton.setAttribute('aria-label', label);
+    coverButton.title = label;
+  }
+
   function applyMainArtwork(nowPlaying) {
     const src = String((nowPlaying && nowPlaying.album_art) || '');
-    if (!src || coverImg.dataset.failedUrl === src) {
-      coverImg.hidden = true;
-      coverPlaceholder.hidden = false;
-      if (!src) coverImg.removeAttribute('src');
-      return;
-    }
-    if (coverImg.getAttribute('src') !== src) {
-      coverImg.hidden = true;
-      coverPlaceholder.hidden = false;
+    if (!src) coverImg.removeAttribute('src');
+    else if (coverImg.getAttribute('src') !== src) {
       coverImg.dataset.failedUrl = '';
       coverImg.alt = nowPlaying && nowPlaying.artist ? `${nowPlaying.artist} 앨범 커버` : '앨범 커버';
       coverImg.src = src;
-      return;
     }
-    if (coverImg.complete && coverImg.naturalWidth > 0) {
-      coverImg.hidden = false;
-      coverPlaceholder.hidden = true;
-    }
+    renderCover();
   }
 
-  coverImg.addEventListener('load', () => { coverImg.hidden = false; coverPlaceholder.hidden = true; });
+  coverButton.onclick = () => { preferTurntable = !preferTurntable; renderCover(); };
+  coverImg.addEventListener('load', renderCover);
+  recordLabel.addEventListener('load', renderCover);
+  recordLabel.addEventListener('error', () => { recordLabel.hidden = true; });
   coverImg.addEventListener('error', () => {
     coverImg.dataset.failedUrl = coverImg.getAttribute('src') || '';
-    coverImg.hidden = true;
-    coverPlaceholder.hidden = false;
+    renderCover();
   });
 
   function renderStations(snap) {
-    stationsEl.innerHTML = snap.stations.map((station) => `
-      <button type="button" class="jazzradio-card${snap.selectedStation && snap.selectedStation.id === station.id ? ' active' : ''}" data-station-id="${escapeHtml(station.id)}">
-        <span class="jazzradio-card-top"><span class="jazzradio-card-icon"><i class="${escapeHtml(station.icon || 'fa-solid fa-music')}"></i></span><span class="jazzradio-badge">LIVE</span></span>
-        <strong>${escapeHtml(station.name)}</strong>
-        <span class="jazzradio-subtitle">${escapeHtml(station.subtitle)}</span>
-        <span class="jazzradio-description">${escapeHtml(station.description)}</span>
-        <span class="jazzradio-quality"><i class="fa-solid fa-wave-square"></i> ${escapeHtml(station.quality)}</span>
-      </button>
-    `).join('');
+    stationsEl.innerHTML = snap.stations.map((station) => `<button type="button" class="jazzradio-card${snap.selectedStation && snap.selectedStation.id === station.id ? ' active' : ''}" data-station-id="${escapeHtml(station.id)}" aria-label="${escapeHtml(station.name)} 선택" aria-current="${!!snap.selectedStation && snap.selectedStation.id === station.id}"></button>`).join('');
     stationsEl.querySelectorAll('.jazzradio-card').forEach((card) => {
       card.addEventListener('click', () => engine.selectStation(card.dataset.stationId, true));
     });
   }
 
+  const infoPanel = root.querySelector('#jazzradio-info-panel');
+  const infoOpen = root.querySelector('#jazzradio-info-open');
+  let viewDetached = false;
+  let infoTrigger = null;
+  function openInfo(event) { infoTrigger = event.currentTarget; if (officialSite.hidden) websiteLoaded = false; if (!infoPanel.open) infoPanel.showModal(); loadArtistWebsite(engine.getState()); if (root.querySelector('#jazzradio-settings-tab').getAttribute('aria-selected') === 'true') requestBackgroundSettings(); }
+  infoOpen.onclick = openInfo;
+  root.querySelector('#jazzradio-info-close').onclick = () => infoPanel.close();
+  infoPanel.addEventListener('close', () => { cancelBackgroundSettings(); if (infoTrigger && infoTrigger.isConnected) infoTrigger.focus(); });
+  infoPanel.addEventListener('click', event => { if (event.target === infoPanel && event.clientX < infoPanel.getBoundingClientRect().left) infoPanel.close(); });
+  const infoTabs = [...infoPanel.querySelectorAll('[role="tab"]')];
+  function selectInfoTab(tab, focus) {
+    infoTabs.forEach(item => {
+      const selected = item === tab;
+      item.setAttribute('aria-selected', String(selected));
+      item.tabIndex = selected ? 0 : -1;
+      root.querySelector(`#${item.getAttribute('aria-controls')}`).hidden = !selected;
+    });
+    infoPanel.scrollTop = 0;
+    if (focus) tab.focus();
+    if (tab.id === 'jazzradio-info-tab') loadArtistWebsite(engine.getState());
+    else requestBackgroundSettings();
+  }
+  infoTabs.forEach((tab, index) => {
+    tab.onclick = () => selectInfoTab(tab, false);
+    tab.onkeydown = event => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? infoTabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + infoTabs.length) % infoTabs.length;
+      selectInfoTab(infoTabs[next], true);
+    };
+  });
+  const colorInput = root.querySelector('#jazzradio-theme-color');
+  const colorValue = root.querySelector('#jazzradio-theme-color-value');
+  const colorPresets = [...root.querySelectorAll('[data-jazzradio-color]')];
+  colorPresets.forEach(button => { button.onclick = () => {
+    engine.setColorTheme(button.dataset.jazzradioColor);
+    if (!button.dataset.jazzradioColor) engine.setColorTone(100);
+  }; });
+  colorInput.oninput = colorInput.onchange = () => engine.setColorTheme(colorInput.value);
+  const colorTone = root.querySelector('#jazzradio-color-tone');
+  const colorToneValue = root.querySelector('#jazzradio-color-tone-value');
+  const dockPosition = root.querySelector('#jazzradio-dock-viz-position');
+  colorTone.oninput = colorTone.onchange = () => engine.setColorTone(colorTone.value);
+  dockPosition.onchange = () => engine.setDockVisualizerPosition(dockPosition.value);
+  function renderColorSettings(snap) {
+    const color = snap.colorTheme || '#54b2dc';
+    if (colorInput.value !== color) colorInput.value = color;
+    const label = snap.colorTheme ? snap.colorTheme.toUpperCase() : '기본 색상';
+    if (colorValue.textContent !== label) colorValue.textContent = label;
+    colorPresets.forEach(button => button.setAttribute('aria-pressed', String(button.dataset.jazzradioColor === snap.colorTheme)));
+    if (colorTone.value !== String(snap.colorTone)) colorTone.value = String(snap.colorTone);
+    colorTone.parentElement.style.setProperty('--jr-volume', `${snap.colorTone}%`);
+    const toneLabel = `${snap.colorTone}%`;
+    if (colorToneValue.textContent !== toneLabel) colorToneValue.textContent = toneLabel;
+    if (dockPosition.value !== snap.dockVisualizerPosition) dockPosition.value = snap.dockVisualizerPosition;
+  }
+  const backgroundForm = root.querySelector('#jazzradio-background-form');
+  const backgroundKey = root.querySelector('#jazzradio-background-key');
+  const backgroundTerms = root.querySelector('#jazzradio-background-terms');
+  const backgroundSave = root.querySelector('#jazzradio-background-save');
+  const backgroundDelete = root.querySelector('#jazzradio-background-delete');
+  const settingsStatus = root.querySelector('#jazzradio-background-settings-status');
+  let backgroundSettings = null, settingsRequest = null;
+  function renderBackgroundSettings() {
+    const editable = !!backgroundSettings && backgroundSettings.can_edit;
+    if (!editable) backgroundKey.value = '';
+    backgroundForm.hidden = !editable;
+    [backgroundKey, backgroundTerms, backgroundSave, backgroundDelete].forEach(input => { input.disabled = !editable || !!settingsRequest || viewDetached; });
+    backgroundForm.setAttribute('aria-busy', String(!!settingsRequest));
+    if (!backgroundSettings) return;
+    root.querySelector('#jazzradio-background-source').textContent = {detail_studio:'Detail Studio 설정 사용 중', jazzradio:'Jazzradio 자체 설정 사용 중', default:'기본 사진 사용 중'}[backgroundSettings.source];
+    root.querySelector('#jazzradio-background-key-state').textContent = backgroundSettings.key_saved ? '자체 Access Key가 저장되어 있습니다.' : '저장된 자체 Access Key가 없습니다.';
+  }
+  function cancelBackgroundSettings() {
+    backgroundKey.value = '';
+    if (settingsRequest) settingsRequest.abort();
+    settingsRequest = null;
+    renderBackgroundSettings();
+  }
+  async function requestBackgroundSettings(operation) {
+    if (viewDetached || settingsRequest || operation && (!backgroundSettings || !backgroundSettings.can_edit)) return;
+    if (operation === 'save' && !backgroundKey.value.trim() && !backgroundSettings.key_saved) {
+      settingsStatus.textContent = 'Unsplash Access Key를 입력해 주세요.';
+      backgroundKey.focus();
+      return;
+    }
+    const request = new AbortController();
+    settingsRequest = request;
+    settingsStatus.textContent = operation ? '배경 설정을 저장하고 있습니다.' : '배경 설정을 확인하고 있습니다.';
+    renderBackgroundSettings();
+    const timeout = window.setTimeout(() => request.abort(), 12000);
+    try {
+      const context = operation === 'save' ? {operation, unsplash_key: backgroundKey.value.trim(), unsplash_terms: backgroundTerms.checked} : {operation};
+      const response = await fetch(operation ? '/api/media/context-menu/book/plugins/action' : `${DATA_URL}&background_settings=1`, operation ? {
+        method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json', 'X-Jazzradio-Settings':'1'},
+        body:JSON.stringify({type:'general', plugin_id:'jazzradio', action_id:'background_settings', context}), signal:request.signal,
+      } : {credentials:'same-origin', cache:'no-store', signal:request.signal});
+      if (!response.ok) throw new Error('settings request failed');
+      const data = await response.json();
+      if (viewDetached || !root.isConnected || settingsRequest !== request) return;
+      if (request.signal.aborted) throw new Error('settings request timed out');
+      const settings = data && data.background_settings;
+      if (!data.success || !settings || typeof settings.can_edit !== 'boolean' || typeof settings.key_saved !== 'boolean' || typeof settings.terms !== 'boolean' || !['detail_studio', 'jazzradio', 'default'].includes(settings.source)) {
+        if (operation) throw new Error('settings response invalid');
+        backgroundSettings = null;
+        settingsStatus.textContent = '배경 설정을 사용하려면 Jazzradio 서버 플러그인을 업데이트해 주세요.';
+        return;
+      }
+      backgroundSettings = settings;
+      backgroundTerms.checked = settings.terms;
+      if (operation) {
+        backgroundKey.value = '';
+        settingsStatus.textContent = operation === 'delete' ? '자체 설정을 삭제했습니다.' : '배경 설정을 저장했습니다.';
+        if (settings.source === 'detail_studio') settingsStatus.textContent += ' Detail Studio 설정을 먼저 사용하며 자체 설정은 대기합니다.';
+        loadBackground(false);
+      } else settingsStatus.textContent = settings.can_edit ? '' : '배경 설정은 관리자만 변경할 수 있습니다.';
+    } catch (_) {
+      if (viewDetached || !root.isConnected || settingsRequest !== request) return;
+      if (!operation) backgroundSettings = null;
+      settingsStatus.textContent = operation ? '배경 설정을 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.' : '배경 설정을 확인하지 못했습니다. 잠시 후 설정 탭을 다시 열어 주세요.';
+    } finally {
+      window.clearTimeout(timeout);
+      if (settingsRequest === request) { settingsRequest = null; renderBackgroundSettings(); }
+    }
+  }
+  backgroundForm.onsubmit = event => { event.preventDefault(); requestBackgroundSettings('save'); };
+  backgroundDelete.onclick = () => requestBackgroundSettings('delete');
+  const officialSite = root.querySelector('#jazzradio-official-site');
+  let websiteKey = '', websiteLoaded = false, websiteRequest = null, websiteStatus = '미조회';
+  function loadArtistWebsite(snap) {
+    const np = snap.nowPlaying;
+    const artist = np && np.available && !np.stale ? String(np.artist || '').trim() : '';
+    const key = artist ? `${snap.selectedStation.id}|${artist}` : '';
+    if (key !== websiteKey) {
+      if (websiteRequest) websiteRequest.abort();
+      websiteRequest = null;
+      websiteKey = key;
+      websiteLoaded = false;
+      websiteStatus = '미조회';
+      officialSite.hidden = true;
+      officialSite.removeAttribute('href');
+    }
+    if (!key || !infoPanel.open || websiteLoaded || websiteRequest) return;
+    const request = new AbortController();
+    websiteRequest = request;
+    websiteStatus = '조회 중';
+    const timeout = window.setTimeout(() => request.abort(), 20000);
+    fetch(`${DATA_URL}&artist_site=1&station=${encodeURIComponent(snap.selectedStation.id)}`, {credentials:'same-origin', cache:'no-store', signal:request.signal})
+      .then(response => { if (!response.ok) throw new Error(`HTTP ${response.status}`); return response.json(); })
+      .then(data => {
+        if (request.signal.aborted || key !== websiteKey || !root.isConnected) return;
+        if (!data || !data.success || !Object.prototype.hasOwnProperty.call(data, 'official_site')) { websiteStatus = '서버 업데이트 필요'; return; }
+        if (data.artist !== artist) { websiteStatus = '곡 정보 갱신 대기'; return; }
+        websiteStatus = {found:'확인', not_found:'등록 링크 없음', ambiguous:'아티스트 식별 불확실', unavailable:'연결 실패', no_artist:'아티스트 정보 없음'}[data.official_site_status] || '등록 링크 없음';
+        if (!data.official_site) return;
+        const url = new URL(data.official_site);
+        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) { websiteStatus = '유효하지 않은 링크'; return; }
+        officialSite.href = `${url.origin}/`;
+        officialSite.querySelector('small').textContent = url.hostname.replace(/^www\./, '');
+        officialSite.setAttribute('aria-label', `${artist} 공식 홈페이지 · MusicBrainz 등록 링크`);
+        officialSite.hidden = false;
+        websiteStatus = '확인';
+      })
+      .catch(error => { if (key === websiteKey) websiteStatus = error.name === 'AbortError' ? '시간 초과' : '연결 실패'; })
+      .finally(() => { window.clearTimeout(timeout); if (websiteRequest === request) { websiteRequest = null; websiteLoaded = true; if (root.isConnected) renderView(engine.getState()); } });
+  }
+
+  function renderTrackInfo(snap) {
+    const np = snap.nowPlaying && snap.nowPlaying.available ? snap.nowPlaying : null;
+    const query = np ? [np.artist, np.title].filter(Boolean).join(' ') : '';
+    root.querySelector('#jazzradio-info-title').textContent = np ? np.title || np.raw || '곡명 정보 없음' : '현재 곡 정보 없음';
+    const artist = root.querySelector('#jazzradio-info-artist');
+    artist.textContent = np ? np.artist || '아티스트 정보 없음' : '';
+    const artistUrl = np && safeLink(np.artist_url, ['music.apple.com', 'itunes.apple.com']);
+    if (artistUrl) artist.href = artistUrl; else artist.removeAttribute('href');
+    root.querySelector('#jazzradio-info-album').textContent = np ? np.album_name || '' : '';
+    const img = root.querySelector('#jazzradio-info-cover');
+    const cover = np && safeLink(np.album_art);
+    if (cover && img.getAttribute('src') !== cover) { img.src = cover; img.hidden = false; }
+    if (!cover) { img.hidden = true; img.removeAttribute('src'); }
+    img.onerror = () => { img.hidden = true; };
+    const sources = root.querySelector('#jazzradio-info-sources');
+    [['mb', 'metadata_source_url'], ['caa', 'cover_source_url']].forEach(([name, field]) => {
+      const link = sources.querySelector(`[data-jazzradio-source="${name}"]`);
+      const href = np && safeLink(np[field], ['musicbrainz.org']);
+      link.hidden = !href;
+      if (href) link.href = href; else link.removeAttribute('href');
+    });
+    sources.hidden = !Array.from(sources.querySelectorAll('a')).some(link => !link.hidden);
+    const facts = [['방송국', snap.selectedStation && snap.selectedStation.name], ['앨범', np && np.album_name], ['장르', np && np.genre], ['발매', np && np.release_date && String(np.release_date).slice(0, 10)], ['수록곡 길이', np && np.duration_ms > 0 && elapsedText(np.duration_ms / 1000)]];
+    const dl = root.querySelector('#jazzradio-info-facts');
+    dl.replaceChildren();
+    facts.filter(([,value]) => value).forEach(([key,value]) => { const dt = document.createElement('dt'), dd = document.createElement('dd'); dt.textContent = key; dd.textContent = value; dl.append(dt,dd); });
+    const apple = root.querySelector('[data-jazzradio-service="apple"]');
+    const exact = np && safeLink(np.track_url, ['music.apple.com', 'itunes.apple.com']);
+    const urls = {apple: exact || `https://music.apple.com/search?term=${encodeURIComponent(query)}`, spotify: `https://open.spotify.com/search/${encodeURIComponent(query)}`, youtube: `https://music.youtube.com/search?q=${encodeURIComponent(query)}`};
+    root.querySelectorAll('[data-jazzradio-service]').forEach(link => {
+      if (query) { link.href = urls[link.dataset.jazzradioService]; link.removeAttribute('aria-disabled'); }
+      else { link.removeAttribute('href'); link.setAttribute('aria-disabled','true'); }
+    });
+    apple.title = exact ? 'Apple Music 곡 페이지' : 'Apple Music에서 현재 곡 검색';
+    loadArtistWebsite(snap);
+    root.querySelector('#jazzradio-info-note').textContent = np ? '가수와 곡명을 기준으로 음악 서비스에서 찾아보세요.' : '방송국에서 곡 정보를 보내면 아티스트와 앨범 자료가 여기에 표시됩니다.';
+  }
+  function selectRelativeStation(direction) {
+    const snap = engine.getState(), count = snap.stations.length;
+    if (!count) return;
+    const index = snap.stations.findIndex(item => snap.selectedStation && item.id === snap.selectedStation.id);
+    engine.selectStation(snap.stations[(Math.max(0,index) + direction + count) % count].id, true);
+  }
+  root.querySelector('#jazzradio-station-prev').onclick = () => selectRelativeStation(-1);
+  root.querySelector('#jazzradio-station-next').onclick = () => selectRelativeStation(1);
+  root.querySelector('.jazzradio-brand').onclick = event => { event.preventDefault(); root.scrollIntoView({behavior:'smooth',block:'start'}); };
+  const background = root.querySelector('#jazzradio-background');
+  const credit = root.querySelector('#jazzradio-photo-credit');
+  function showBackground(photo) {
+    const url = safeLink(photo && photo.url, ['images.unsplash.com']);
+    if (!url) return;
+    background.src = url;
+    const source = safeLink(photo.source_url, ['unsplash.com']);
+    const creator = root.querySelector('#jazzradio-photo-creator');
+    const creatorUrl = safeLink(photo.creator_url, ['unsplash.com']);
+    credit.firstElementChild.textContent = photo.creator ? 'Photo by ' : '';
+    creator.textContent = photo.creator || 'Photo';
+    if (creatorUrl) creator.href = creatorUrl; else creator.removeAttribute('href');
+    if (source) { root.querySelector('#jazzradio-photo-source').href = source; credit.hidden = false; }
+  }
+  showBackground(DEFAULT_BACKGROUND);
+  const backgroundButton = root.querySelector('#jazzradio-background-refresh');
+  const backgroundStatus = root.querySelector('#jazzradio-background-status');
+  let backgroundStatusTimer = null, backgroundRequest = null;
+  function showBackgroundStatus(text) {
+    window.clearTimeout(backgroundStatusTimer);
+    backgroundStatus.textContent = text;
+    backgroundStatus.hidden = false;
+    backgroundStatusTimer = window.setTimeout(() => { backgroundStatus.hidden = true; backgroundStatus.textContent = ''; }, 4000);
+  }
+  async function loadBackground(force) {
+    if (viewDetached || force && backgroundRequest) return;
+    if (backgroundRequest) backgroundRequest.abort();
+    backgroundButton.disabled = true;
+    backgroundButton.setAttribute('aria-busy', 'true');
+    const controller = new AbortController();
+    backgroundRequest = controller;
+    const timeout = window.setTimeout(() => controller.abort(), 12000);
+    try {
+      const response = await fetch(`${DATA_URL}&background=1${force ? '&refresh=1' : ''}`, {credentials:'same-origin',cache:'no-store',signal:controller.signal});
+      if (!response.ok) throw new Error('background request failed');
+      const data = await response.json();
+      if (viewDetached || !root.isConnected || controller.signal.aborted || backgroundRequest !== controller) return;
+      if (!data.success || !data.background || typeof data.background.url !== 'string') throw new Error('background response invalid');
+      showBackground(data.background.source === 'default' || !safeLink(data.background.url, ['images.unsplash.com']) ? DEFAULT_BACKGROUND : data.background);
+      if (force) {
+        const photo = data.background;
+        showBackgroundStatus(photo.reason === 'cooldown' ? `${photo.retry_after || 60}초 후 다시 변경할 수 있습니다.` : photo.reason ? '사진을 변경하지 못했습니다. Unsplash 설정이나 연결 상태를 확인해 주세요.' : '배경 사진을 변경했습니다. 연속 변경은 1분 간격입니다.');
+      }
+    } catch (_) {
+      if (force && !viewDetached && root.isConnected && backgroundRequest === controller) showBackgroundStatus('사진을 불러오지 못해 현재 배경을 유지합니다.');
+    } finally {
+      window.clearTimeout(timeout);
+      if (backgroundRequest === controller) {
+        backgroundRequest = null;
+        backgroundButton.disabled = false;
+        backgroundButton.removeAttribute('aria-busy');
+      }
+    }
+  }
+  backgroundButton.onclick = () => loadBackground(true);
+  loadBackground(false);
+
   let renderedStationSignature = '';
   function renderView(snap) {
+    renderColorSettings(snap);
     const station = snap.selectedStation;
     const np = snap.nowPlaying;
+    root.querySelectorAll('[data-jazzradio-elapsed]').forEach(el => { const text = elapsedText(snap.elapsedSeconds); if (el.textContent !== text) el.textContent = text; });
+    root.querySelector('.jazzradio-player').classList.toggle('is-playing', snap.playing);
+    const vizToggle = root.querySelector('#jazzradio-visualizer-toggle');
+    vizToggle.setAttribute('aria-pressed', String(snap.visualizerEnabled));
+    vizToggle.setAttribute('aria-expanded', String(snap.visualizerEnabled));
+    vizToggle.title = snap.visualizerEnabled ? '비주얼라이저 끄기' : '비주얼라이저 켜기';
+    const vizPanel = root.querySelector('#jazzradio-viz-panel');
+    vizPanel.classList.toggle('is-open', snap.visualizerEnabled);
+    vizPanel.inert = !snap.visualizerEnabled;
+    vizPanel.setAttribute('aria-hidden', String(!snap.visualizerEnabled));
+    root.querySelector('#jazzradio-equalizer').hidden = !snap.visualizerEnabled;
+    const muteButton = root.querySelector('#jazzradio-mute');
+    muteButton.setAttribute('aria-pressed', String(snap.muted));
+    muteButton.setAttribute('aria-label', snap.muted ? '음소거 해제' : '음소거');
+    muteButton.title = snap.muted ? '음소거 해제' : '음소거';
+    muteButton.innerHTML = `<i class="fa-solid fa-volume-${snap.muted ? 'xmark' : 'low'}" aria-hidden="true"></i>`;
+    root.querySelector('#jazzradio-on-air').textContent = snap.waiting ? 'CONNECTING' : snap.playing ? '● ON AIR' : 'STANDBY';
+    root.querySelector('#jazzradio-on-air').classList.toggle('is-paused', !snap.playing);
+    if (station) {
+      root.querySelector('#jazzradio-station-name').innerHTML = ({relaxingjazz: 'Relaxing<br><em>Jazz.</em>', 'radio-swiss-jazz': 'Radio Swiss<br><em>Jazz.</em>', jazz24: 'Jazz<em>24.</em>'})[station.id] || escapeHtml(station.name);
+      root.querySelector('#jazzradio-station-subtitle').textContent = station.subtitle || '';
+      root.querySelector('#jazzradio-station-description').textContent = station.description || '';
+      root.querySelector('#jazzradio-station-quality').textContent = station.quality || 'LIVE';
+      root.querySelector('#jazzradio-station-eyebrow').textContent = station.id === 'relaxingjazz' ? 'LIVE FROM SAINT LUCIA' : station.id === 'radio-swiss-jazz' ? 'LIVE FROM SWITZERLAND' : 'LIVE FROM SEATTLE';
+      root.querySelector('#jazzradio-station-index').textContent = `${String(snap.stations.indexOf(station) + 1).padStart(2, '0')} / ${String(snap.stations.length).padStart(2, '0')}`;
+    }
+    root.querySelector('#jazzradio-now-album').textContent = np && np.available ? np.album_name || '앨범 정보 없음' : '잠시 후 현재 곡 정보가 표시됩니다.';
+    renderTrackInfo(snap);
     const signature = snap.stations.map((s) => s.id).join('|') + '::' + (station ? station.id : '');
     if (signature !== renderedStationSignature) {
       renderedStationSignature = signature;
@@ -1716,12 +2206,8 @@
     controlDisc.classList.toggle('playing', snap.playing);
     controlDisc.setAttribute('aria-pressed', String(snap.noiseEnabled));
     controlDisc.title = snap.noiseEnabled ? 'LP 노이즈 끄기' : 'LP 노이즈 켜기';
-    const noiseControls = root.querySelector('.jazzradio-noise');
-    noiseControls.hidden = !snap.noiseEnabled || !snap.noiseControlsVisible;
-    noiseControls.querySelector('input').value = String(snap.noiseLevel);
-    noiseControls.querySelector('output').textContent = `${snap.noiseLevel}%`;
     const power = root.querySelector('[data-jazzradio-power]');
-    power.hidden = snap.visualizerMode !== 'tube';
+    power.hidden = !snap.visualizerEnabled || snap.visualizerMode !== 'tube';
     power.disabled = !station;
     power.setAttribute('aria-pressed', String(snap.playing));
     power.setAttribute('aria-label', snap.playing ? '라디오 일시정지' : '라디오 재생');
@@ -1740,7 +2226,7 @@
     pcmLink.hidden = !isIOSDevice();
     const diagnostic = engine.getDiagnostics();
     const route = diagnostic.analysisRoute === 'pcm' ? `PCM 분석 ${diagnostic.pcmStatus}` : '기본 분석';
-    analysisNote.textContent = `앱 ${diagnostic.version} / 서버 ${diagnostic.serverVersion} · ${diagnostic.playbackRoute === 'pcm' ? '단일 PCM 재생' : '방송국 직접 재생'}(${diagnostic.playbackRoute === 'pcm' ? 'Web Audio 출력' : diagnostic.mediaAttached ? 'Web Audio 출력' : '기본 오디오 출력'}) · ${route} · 분석 ${diagnostic.analysisStatus} · Context ${diagnostic.contextState}${isIOSDevice() ? ` · Audio Session ${diagnostic.audioSessionType}` : ''} · 주파수 ${diagnostic.frequencyPeak} / 파형 ${diagnostic.waveMin}~${diagnostic.waveMax} · LP 노이즈 ${snap.noiseEnabled ? `켜짐 ${snap.noiseLevel}%` : '꺼짐'}${diagnostic.pcmError ? ` · PCM 오류 ${diagnostic.pcmError}` : ''}${diagnostic.playbackError ? ` · 재생 오류 ${diagnostic.playbackError}` : ''}`;
+    analysisNote.textContent = `앱 ${diagnostic.version} / 서버 ${diagnostic.serverVersion} · ${diagnostic.playbackRoute === 'pcm' ? '단일 PCM 재생' : '방송국 직접 재생'}(${diagnostic.playbackRoute === 'pcm' ? 'Web Audio 출력' : diagnostic.mediaAttached ? 'Web Audio 출력' : '기본 오디오 출력'}) · ${route} · 분석 ${diagnostic.analysisStatus} · Context ${diagnostic.contextState}${isIOSDevice() ? ` · Audio Session ${diagnostic.audioSessionType}` : ''} · 주파수 ${diagnostic.frequencyPeak} / 파형 ${diagnostic.waveMin}~${diagnostic.waveMax} · 공식 홈페이지 ${websiteStatus} · LP 노이즈 ${snap.noiseEnabled ? `켜짐 ${snap.noiseLevel}%` : '꺼짐'}${diagnostic.pcmError ? ` · PCM 오류 ${diagnostic.pcmError}` : ''}${diagnostic.playbackError ? ` · 재생 오류 ${diagnostic.playbackError}` : ''}`;
     if (visualizerModeButton && visualizerModeLabelEl) {
       visualizerModeButton.dataset.mode = snap.visualizerMode;
       if (mainVisualizer) mainVisualizer.dataset.mode = snap.visualizerMode;
@@ -1765,31 +2251,33 @@
       applyMainArtwork(null);
     }
 
+    stationsEl.querySelectorAll('.jazzradio-card').forEach(card => { card.setAttribute('aria-current', String(!!station && card.dataset.stationId === station.id)); });
     messageEl.textContent = snap.error || '';
     messageEl.hidden = !snap.error;
 
-    if (isIOSDevice()) {
-      volumeWrap.classList.add('is-ios');
-      volume.hidden = true;
-      volumeValue.hidden = true;
-      volumeNote.hidden = false;
-      volumeNote.textContent = iosVolumeText();
-    } else {
-      volumeWrap.classList.remove('is-ios');
-      volume.hidden = false;
-      volumeValue.hidden = false;
-      volumeNote.hidden = true;
-      volume.value = String(snap.volume);
-      volumeValue.textContent = `${snap.volume}%`;
-    }
+    renderVolumeControls(volumeControls, snap);
   }
 
-  if (root.__jazzradioDetach) root.__jazzradioDetach();
-  root.__jazzradioDetach = engine.attachView(root, renderView);
+  const detachView = engine.attachView(root, renderView);
+  const viewObserver = new MutationObserver(() => { if (!root.isConnected) root.__jazzradioDetach(); });
+  viewObserver.observe(document.body, {childList:true, subtree:true});
+  root.__jazzradioDetach = () => {
+    if (viewDetached) return;
+    viewDetached = true;
+    viewObserver.disconnect();
+    cancelBackgroundSettings();
+    if (backgroundRequest) backgroundRequest.abort();
+    if (websiteRequest) websiteRequest.abort();
+    window.clearTimeout(backgroundStatusTimer);
+    backgroundStatus.hidden = true;
+    backgroundStatus.textContent = '';
+    detachView();
+  };
   playButton.onclick = () => engine.toggle();
   controlDisc.onclick = () => engine.toggleNoise();
-  root.querySelector('#jazzradio-noise-level').oninput = event => engine.setNoiseLevel(event.target.value);
-  volume.oninput = () => engine.setVolume(volume.value);
+  volume.oninput = () => engine.adjustVolume(volume.value);
+  root.querySelector('#jazzradio-mute').onclick = () => engine.toggleMuted();
+  root.querySelector('#jazzradio-visualizer-toggle').onclick = () => engine.toggleVisualizer();
   if (mainVisualizer) mainVisualizer.onclick = event => {
     if (event.target.closest('[data-jazzradio-power]')) engine.toggle();
     else engine.cycleVisualizerMode();
